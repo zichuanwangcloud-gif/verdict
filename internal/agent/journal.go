@@ -113,22 +113,32 @@ func (j *Journal) Runs() []string {
 	return out
 }
 
-// Finished 判断某测试是否已有 result 事件。
-func (j *Journal) Finished(runID string) bool {
+// has 判断某测试的事件日志里是否有满足条件的事件。
+func (j *Journal) has(runID string, match func(protocol.Event) bool) bool {
 	evs, _ := j.Since(runID, 0)
 	for _, ev := range evs {
-		if ev.Kind == protocol.KindResult {
+		if match(ev) {
 			return true
 		}
 	}
 	return false
 }
 
+// Closed 判断某测试是否已收尾（有 closed 事件）。
+func (j *Journal) Closed(runID string) bool {
+	return j.has(runID, func(ev protocol.Event) bool { return ev.Kind == protocol.KindClosed })
+}
+
+// StageDone 判断某阶段是否已有结果。
+func (j *Journal) StageDone(runID, stageID string) bool {
+	return j.has(runID, func(ev protocol.Event) bool { return ev.Kind == protocol.KindStageResult && ev.StageID == stageID })
+}
+
 // Prune 删除早于 maxAge 且已结束的日志。
 func (j *Journal) Prune(maxAge time.Duration) {
 	for _, id := range j.Runs() {
 		st, err := os.Stat(j.path(id))
-		if err != nil || time.Since(st.ModTime()) < maxAge || !j.Finished(id) {
+		if err != nil || time.Since(st.ModTime()) < maxAge || !j.Closed(id) {
 			continue
 		}
 		j.mu.Lock()

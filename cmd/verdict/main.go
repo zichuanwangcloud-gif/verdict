@@ -85,7 +85,7 @@ func runServer(args []string) {
 	}
 	defer st.Close()
 
-	srv := server.New(server.Config{AdminToken: token, WebDir: *webDir, BinDir: *binDir}, st)
+	srv := server.New(server.Config{AdminToken: token, WebDir: *webDir, BinDir: *binDir, DataDir: filepath.Dir(*dbPath)}, st)
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	go srv.Hub().Watchdog(ctx)

@@ -9,11 +9,11 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"time"
 
 	_ "modernc.org/sqlite"
 
-	"verdict/internal/linear"
 	"verdict/internal/protocol"
 )
 
@@ -74,7 +74,55 @@ CREATE TABLE IF NOT EXISTS run_logs (
 CREATE TABLE IF NOT EXISTS run_seq (
   run_id TEXT PRIMARY KEY REFERENCES runs(id) ON DELETE CASCADE,
   last_seq INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS stages (
+  id TEXT PRIMARY KEY,
+  run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+  seq INTEGER NOT NULL,
+  role TEXT NOT NULL,
+  round INTEGER NOT NULL DEFAULT 0,
+  kind TEXT NOT NULL,
+  harness TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL,
+  note TEXT NOT NULL DEFAULT '',
+  error TEXT NOT NULL DEFAULT '',
+  spec TEXT NOT NULL DEFAULT '{}',
+  output TEXT NOT NULL DEFAULT '',
+  cost_usd REAL NOT NULL DEFAULT 0,
+  duration_ms INTEGER NOT NULL DEFAULT 0,
+  service TEXT NOT NULL DEFAULT 'null',
+  artifacts TEXT NOT NULL DEFAULT '[]',
+  created_at TEXT NOT NULL,
+  started_at TEXT NOT NULL DEFAULT '',
+  finished_at TEXT NOT NULL DEFAULT '',
+  UNIQUE (run_id, seq)
+);
+CREATE TABLE IF NOT EXISTS artifacts (
+  run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+  name TEXT NOT NULL,
+  stage_id TEXT NOT NULL DEFAULT '',
+  size INTEGER NOT NULL,
+  content_type TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  PRIMARY KEY (run_id, name)
 );`
+
+// migrations 给旧库补列：表名 → 列定义。只增不改，旧数据原样保留。
+var migrations = []struct{ table, column, def string }{
+	{"repos", "setup_cmd", "TEXT NOT NULL DEFAULT ''"},
+	{"repos", "start_cmd", "TEXT NOT NULL DEFAULT ''"},
+	{"repos", "health_url", "TEXT NOT NULL DEFAULT ''"},
+	{"repos", "app_url", "TEXT NOT NULL DEFAULT ''"},
+	{"runs", "tier", "TEXT NOT NULL DEFAULT ''"},
+	{"runs", "config", "TEXT NOT NULL DEFAULT '{}'"},
+	{"runs", "findings", "TEXT NOT NULL DEFAULT '[]'"},
+	{"runs", "pages", "TEXT NOT NULL DEFAULT '[]'"},
+	{"runs", "approved", "INTEGER NOT NULL DEFAULT 0"},
+	{"runs", "approval_note", "TEXT NOT NULL DEFAULT ''"},
+	{"runs", "current_stage", "TEXT NOT NULL DEFAULT ''"},
+	{"runs", "awaiting_since", "TEXT NOT NULL DEFAULT ''"},
+	{"run_logs", "stage", "TEXT NOT NULL DEFAULT ''"},
+}
 
 // 测试状态。
 const (
@@ -82,14 +130,24 @@ const (
 	StatusDispatched = "dispatched"
 	StatusPreparing  = "preparing"
 	StatusRunning    = "running"
+	StatusAwaiting   = "awaiting_approval"
+	StatusFinalizing = "finalizing"
 	StatusCompleted  = "completed"
 	StatusError      = "error"
 	StatusCanceled   = "canceled"
 )
 
+// ActiveStatuses 是已交给运行时、尚未结束的状态。
+var ActiveStatuses = []string{StatusDispatched, StatusPreparing, StatusRunning, StatusAwaiting, StatusFinalizing}
+
 // Active 表示测试已交给运行时、尚未结束。
 func Active(status string) bool {
-	return status == StatusDispatched || status == StatusPreparing || status == StatusRunning
+	for _, s := range ActiveStatuses {
+		if s == status {
+			return true
+		}
+	}
+	return false
 }
 
 func Terminal(status string) bool {
@@ -111,7 +169,41 @@ func Open(path string) (*Store, error) {
 		db.Close()
 		return nil, err
 	}
+	if err := migrate(db); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("数据库迁移失败: %w", err)
+	}
 	return &Store{db: db}, nil
+}
+
+func migrate(db *sql.DB) error {
+	have := map[string]map[string]bool{}
+	for _, m := range migrations {
+		if have[m.table] == nil {
+			rows, err := db.Query(`SELECT name FROM pragma_table_info(?)`, m.table)
+			if err != nil {
+				return err
+			}
+			have[m.table] = map[string]bool{}
+			for rows.Next() {
+				var n string
+				if err := rows.Scan(&n); err != nil {
+					rows.Close()
+					return err
+				}
+				have[m.table][n] = true
+			}
+			rows.Close()
+		}
+		if !have[m.table][m.column] {
+			if _, err := db.Exec(fmt.Sprintf(`ALTER TABLE %s ADD COLUMN %s %s`, m.table, m.column, m.def)); err != nil {
+				return err
+			}
+			have[m.table][m.column] = true
+		}
+	}
+	_, err := db.Exec(`CREATE INDEX IF NOT EXISTS stages_run ON stages(run_id, seq)`)
+	return err
 }
 
 func (s *Store) Close() error { return s.db.Close() }
@@ -140,6 +232,28 @@ func RandomHex(n int) string {
 func HashToken(t string) string {
 	h := sha256.Sum256([]byte(t))
 	return hex.EncodeToString(h[:])
+}
+
+func toJSON(v any) string {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return "null"
+	}
+	return string(b)
+}
+
+// placeholders 生成 "?,?,?" 与对应参数。
+func placeholders(vals []string) (string, []any) {
+	q := ""
+	args := make([]any, 0, len(vals))
+	for i, v := range vals {
+		if i > 0 {
+			q += ","
+		}
+		q += "?"
+		args = append(args, v)
+	}
+	return q, args
 }
 
 // ---- settings ----
@@ -250,8 +364,8 @@ func (s *Store) DeleteRuntime(ctx context.Context, id int64) error {
 		return err
 	}
 	defer tx.Rollback()
-	if _, err := tx.ExecContext(ctx, `UPDATE runs SET status=?, error='运行时已被删除', finished_at=? WHERE runtime_id=? AND status IN (?,?,?,?)`,
-		StatusError, now(), id, StatusQueued, StatusDispatched, StatusPreparing, StatusRunning); err != nil {
+	if _, err := tx.ExecContext(ctx, `UPDATE runs SET status=?, error='运行时已被删除', finished_at=? WHERE runtime_id=? AND status IN (?,?,?,?,?,?)`,
+		StatusError, now(), id, StatusQueued, StatusDispatched, StatusPreparing, StatusRunning, StatusAwaiting, StatusFinalizing); err != nil {
 		return err
 	}
 	// 测试记录保留，runtime 行改成墓碑：清掉令牌使其无法再连。
@@ -259,337 +373,4 @@ func (s *Store) DeleteRuntime(ctx context.Context, id int64) error {
 		return err
 	}
 	return tx.Commit()
-}
-
-// ---- repos ----
-
-type Repo struct {
-	ID        int64      `json:"id"`
-	URL       string     `json:"url"`
-	Name      string     `json:"name"`
-	TestNotes string     `json:"test_notes"`
-	CreatedAt *time.Time `json:"created_at"`
-}
-
-func scanRepo(sc interface{ Scan(...any) error }) (Repo, error) {
-	var r Repo
-	var created string
-	err := sc.Scan(&r.ID, &r.URL, &r.Name, &r.TestNotes, &created)
-	r.CreatedAt = parseTime(created)
-	return r, err
-}
-
-func (s *Store) Repos(ctx context.Context) ([]Repo, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT id,url,name,test_notes,created_at FROM repos ORDER BY name`)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	out := []Repo{}
-	for rows.Next() {
-		r, err := scanRepo(rows)
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, r)
-	}
-	return out, rows.Err()
-}
-
-func (s *Store) Repo(ctx context.Context, id int64) (Repo, error) {
-	r, err := scanRepo(s.db.QueryRowContext(ctx, `SELECT id,url,name,test_notes,created_at FROM repos WHERE id=?`, id))
-	if errors.Is(err, sql.ErrNoRows) {
-		return r, ErrNotFound
-	}
-	return r, err
-}
-
-func (s *Store) CreateRepo(ctx context.Context, url, name, notes string) (Repo, error) {
-	res, err := s.db.ExecContext(ctx, `INSERT INTO repos(url,name,test_notes,created_at) VALUES(?,?,?,?)`, url, name, notes, now())
-	if err != nil {
-		return Repo{}, err
-	}
-	id, _ := res.LastInsertId()
-	return s.Repo(ctx, id)
-}
-
-func (s *Store) UpdateRepo(ctx context.Context, id int64, url, name, notes string) error {
-	res, err := s.db.ExecContext(ctx, `UPDATE repos SET url=?, name=?, test_notes=? WHERE id=?`, url, name, notes, id)
-	if err != nil {
-		return err
-	}
-	if n, _ := res.RowsAffected(); n == 0 {
-		return ErrNotFound
-	}
-	return nil
-}
-
-func (s *Store) DeleteRepo(ctx context.Context, id int64) error {
-	var n int
-	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM runs WHERE repo_id=?`, id).Scan(&n); err != nil {
-		return err
-	}
-	if n > 0 {
-		return errors.New("该仓库已有测试记录，不能删除")
-	}
-	_, err := s.db.ExecContext(ctx, `DELETE FROM repos WHERE id=?`, id)
-	return err
-}
-
-// ---- runs ----
-
-type Run struct {
-	ID               string              `json:"id"`
-	RepoID           int64               `json:"repo_id"`
-	RepoURL          string              `json:"repo_url"`
-	RepoName         string              `json:"repo_name"`
-	Branch           string              `json:"branch"`
-	CommitSHA        string              `json:"commit_sha"`
-	IssueKey         string              `json:"issue_key"`
-	Issue            linear.Issue        `json:"issue"`
-	RuntimeID        int64               `json:"runtime_id"`
-	RuntimeName      string              `json:"runtime_name"`
-	Harness          string              `json:"harness"`
-	TimeoutMinutes   int                 `json:"timeout_minutes"`
-	Status           string              `json:"status"`
-	Verdict          string              `json:"verdict"`
-	Summary          string              `json:"summary"`
-	ACs              []protocol.ACResult `json:"acs"`
-	Raw              string              `json:"raw,omitempty"`
-	Prompt           string              `json:"prompt,omitempty"`
-	SourceModified   bool                `json:"source_modified"`
-	Diff             string              `json:"diff,omitempty"`
-	CostUSD          float64             `json:"cost_usd"`
-	Error            string              `json:"error"`
-	LinearCommentURL string              `json:"linear_comment_url"`
-	LinearError      string              `json:"linear_error"`
-	CreatedAt        *time.Time          `json:"created_at"`
-	StartedAt        *time.Time          `json:"started_at"`
-	FinishedAt       *time.Time          `json:"finished_at"`
-}
-
-const runCols = `r.id, r.repo_id, p.url, p.name, r.branch, r.commit_sha, r.issue_key, r.issue, r.runtime_id, t.name,
- r.harness, r.timeout_minutes, r.status, r.verdict, r.summary, r.acs, r.raw, r.prompt, r.source_modified, r.diff,
- r.cost_usd, r.error, r.linear_comment_url, r.linear_error, r.created_at, r.started_at, r.finished_at
- FROM runs r JOIN repos p ON p.id=r.repo_id JOIN runtimes t ON t.id=r.runtime_id`
-
-func scanRun(sc interface{ Scan(...any) error }) (Run, error) {
-	var r Run
-	var issue, acs, created, started, finished string
-	var modified int
-	err := sc.Scan(&r.ID, &r.RepoID, &r.RepoURL, &r.RepoName, &r.Branch, &r.CommitSHA, &r.IssueKey, &issue, &r.RuntimeID,
-		&r.RuntimeName, &r.Harness, &r.TimeoutMinutes, &r.Status, &r.Verdict, &r.Summary, &acs, &r.Raw, &r.Prompt,
-		&modified, &r.Diff, &r.CostUSD, &r.Error, &r.LinearCommentURL, &r.LinearError, &created, &started, &finished)
-	if err != nil {
-		return r, err
-	}
-	_ = json.Unmarshal([]byte(issue), &r.Issue)
-	_ = json.Unmarshal([]byte(acs), &r.ACs)
-	if r.ACs == nil {
-		r.ACs = []protocol.ACResult{}
-	}
-	r.SourceModified = modified != 0
-	r.CreatedAt, r.StartedAt, r.FinishedAt = parseTime(created), parseTime(started), parseTime(finished)
-	return r, nil
-}
-
-type NewRun struct {
-	RepoID         int64
-	Branch         string
-	Issue          linear.Issue
-	RuntimeID      int64
-	Harness        string
-	TimeoutMinutes int
-	// Prompt 由调用方根据 ID 生成（提示词里要用到测试 ID）。
-	Prompt func(id string) string
-}
-
-func (s *Store) CreateRun(ctx context.Context, n NewRun) (Run, error) {
-	id := RandomHex(6)
-	issue, _ := json.Marshal(n.Issue)
-	_, err := s.db.ExecContext(ctx, `INSERT INTO runs(id, repo_id, branch, issue_key, issue, runtime_id, harness, timeout_minutes, status, prompt, created_at)
- VALUES(?,?,?,?,?,?,?,?,?,?,?)`, id, n.RepoID, n.Branch, n.Issue.Identifier, string(issue), n.RuntimeID, n.Harness,
-		n.TimeoutMinutes, StatusQueued, n.Prompt(id), now())
-	if err != nil {
-		return Run{}, err
-	}
-	return s.Run(ctx, id)
-}
-
-func (s *Store) Run(ctx context.Context, id string) (Run, error) {
-	r, err := scanRun(s.db.QueryRowContext(ctx, `SELECT `+runCols+` WHERE r.id=?`, id))
-	if errors.Is(err, sql.ErrNoRows) {
-		return r, ErrNotFound
-	}
-	return r, err
-}
-
-func (s *Store) Runs(ctx context.Context, limit int) ([]Run, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT `+runCols+` ORDER BY r.created_at DESC, r.rowid DESC LIMIT ?`, limit)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	out := []Run{}
-	for rows.Next() {
-		r, err := scanRun(rows)
-		if err != nil {
-			return nil, err
-		}
-		// 列表不带大字段。
-		r.Prompt, r.Raw, r.Diff = "", "", ""
-		out = append(out, r)
-	}
-	return out, rows.Err()
-}
-
-// RunsOnRuntime 返回某运行时上处于给定状态的测试，按创建顺序。
-func (s *Store) RunsOnRuntime(ctx context.Context, runtimeID int64, statuses ...string) ([]Run, error) {
-	q := `SELECT ` + runCols + ` WHERE r.runtime_id=? AND r.status IN (`
-	args := []any{runtimeID}
-	for i, st := range statuses {
-		if i > 0 {
-			q += ","
-		}
-		q += "?"
-		args = append(args, st)
-	}
-	q += `) ORDER BY r.created_at, r.rowid`
-	rows, err := s.db.QueryContext(ctx, q, args...)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var out []Run
-	for rows.Next() {
-		r, err := scanRun(rows)
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, r)
-	}
-	return out, rows.Err()
-}
-
-// SetStatus 只在当前状态属于 from 之一时更新，返回是否更新成功。
-func (s *Store) SetStatus(ctx context.Context, id, to, errMsg string, from ...string) (bool, error) {
-	q := `UPDATE runs SET status=?`
-	args := []any{to}
-	if errMsg != "" {
-		q += `, error=?`
-		args = append(args, errMsg)
-	}
-	switch {
-	case to == StatusPreparing || to == StatusRunning:
-		q += `, started_at=CASE WHEN started_at='' THEN ? ELSE started_at END`
-		args = append(args, now())
-	case Terminal(to):
-		q += `, finished_at=?`
-		args = append(args, now())
-	}
-	q += ` WHERE id=?`
-	args = append(args, id)
-	if len(from) > 0 {
-		q += ` AND status IN (`
-		for i, f := range from {
-			if i > 0 {
-				q += ","
-			}
-			q += "?"
-			args = append(args, f)
-		}
-		q += `)`
-	}
-	res, err := s.db.ExecContext(ctx, q, args...)
-	if err != nil {
-		return false, err
-	}
-	n, _ := res.RowsAffected()
-	return n > 0, nil
-}
-
-func (s *Store) SetCommit(ctx context.Context, id, sha string) error {
-	_, err := s.db.ExecContext(ctx, `UPDATE runs SET commit_sha=? WHERE id=?`, sha, id)
-	return err
-}
-
-// Finish 写入终态结果；已处于终态的测试不会被覆盖。
-func (s *Store) Finish(ctx context.Context, id string, res protocol.RunResult) (bool, error) {
-	status := res.Status
-	if !Terminal(status) {
-		status = StatusError
-	}
-	var verdict, summary string
-	acs := []byte("[]")
-	if res.Report != nil && status == StatusCompleted {
-		verdict, summary = res.Report.Verdict(), res.Report.Summary
-		acs, _ = json.Marshal(res.Report.ACs)
-	}
-	modified := 0
-	if res.SourceModified {
-		modified = 1
-	}
-	r, err := s.db.ExecContext(ctx, `UPDATE runs SET status=?, verdict=?, summary=?, acs=?, raw=?, source_modified=?, diff=?, cost_usd=?, error=?, finished_at=?
- WHERE id=? AND status NOT IN (?,?,?)`, status, verdict, summary, string(acs), string(res.Raw), modified, res.Diff, res.CostUSD, res.Error, now(),
-		id, StatusCompleted, StatusError, StatusCanceled)
-	if err != nil {
-		return false, err
-	}
-	n, _ := r.RowsAffected()
-	return n > 0, nil
-}
-
-func (s *Store) SetLinearResult(ctx context.Context, id, url, errMsg string) error {
-	_, err := s.db.ExecContext(ctx, `UPDATE runs SET linear_comment_url=?, linear_error=? WHERE id=?`, url, errMsg, id)
-	return err
-}
-
-// ---- logs / seq ----
-
-func (s *Store) LastSeq(ctx context.Context, runID string) (int64, error) {
-	var n int64
-	err := s.db.QueryRowContext(ctx, `SELECT last_seq FROM run_seq WHERE run_id=?`, runID).Scan(&n)
-	if errors.Is(err, sql.ErrNoRows) {
-		return 0, nil
-	}
-	return n, err
-}
-
-// AcceptSeq 记录已处理的 seq；seq 不大于已记录值时返回 false（重复事件）。
-func (s *Store) AcceptSeq(ctx context.Context, runID string, seq int64) (bool, error) {
-	res, err := s.db.ExecContext(ctx, `INSERT INTO run_seq(run_id,last_seq) VALUES(?,?)
- ON CONFLICT(run_id) DO UPDATE SET last_seq=excluded.last_seq WHERE excluded.last_seq > run_seq.last_seq`, runID, seq)
-	if err != nil {
-		return false, err
-	}
-	n, _ := res.RowsAffected()
-	return n > 0, nil
-}
-
-func (s *Store) AppendLog(ctx context.Context, runID string, seq, ts int64, text string) error {
-	_, err := s.db.ExecContext(ctx, `INSERT OR IGNORE INTO run_logs(run_id,seq,ts,text) VALUES(?,?,?,?)`, runID, seq, ts, text)
-	return err
-}
-
-type LogLine struct {
-	Seq  int64  `json:"seq"`
-	TS   int64  `json:"ts"`
-	Text string `json:"text"`
-}
-
-func (s *Store) Logs(ctx context.Context, runID string, after int64, limit int) ([]LogLine, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT seq,ts,text FROM run_logs WHERE run_id=? AND seq>? ORDER BY seq LIMIT ?`, runID, after, limit)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	out := []LogLine{}
-	for rows.Next() {
-		var l LogLine
-		if err := rows.Scan(&l.Seq, &l.TS, &l.Text); err != nil {
-			return nil, err
-		}
-		out = append(out, l)
-	}
-	return out, rows.Err()
 }

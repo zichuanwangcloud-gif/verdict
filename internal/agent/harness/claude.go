@@ -4,7 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -51,6 +53,14 @@ func (Claude) Detect(ctx context.Context) protocol.HarnessInfo {
 func (Claude) Run(ctx context.Context, spec RunSpec) (Output, error) {
 	args := []string{"-p", "--output-format", "stream-json", "--verbose",
 		"--json-schema", string(spec.Schema), "--dangerously-skip-permissions"}
+	if spec.MCP != nil {
+		f, err := claudeMCPConfig(spec)
+		if err != nil {
+			return Output{}, err
+		}
+		// 只挂平台给的 MCP，避免用户全局配置里的其他 MCP 干扰本阶段。
+		args = append(args, "--mcp-config", f, "--strict-mcp-config")
+	}
 
 	var result *claudeResult
 	err := runStreaming(ctx, spec, "claude", args, func(line []byte) {
@@ -77,6 +87,18 @@ func (Claude) Run(ctx context.Context, spec RunSpec) (Output, error) {
 		return out, ErrNoResult
 	}
 	return out, nil
+}
+
+func claudeMCPConfig(spec RunSpec) (string, error) {
+	if err := os.MkdirAll(spec.TempDir, 0o700); err != nil {
+		return "", err
+	}
+	cfg := map[string]any{"mcpServers": map[string]any{
+		spec.MCP.Name: map[string]any{"type": "stdio", "command": spec.MCP.Command, "args": spec.MCP.Args},
+	}}
+	b, _ := json.Marshal(cfg)
+	p := filepath.Join(spec.TempDir, "mcp.json")
+	return p, os.WriteFile(p, b, 0o600)
 }
 
 type claudeResult struct {

@@ -32,17 +32,15 @@ type Agent struct {
 	cfg     Config
 	journal *Journal
 	ws      Workspace
+	http    *http.Client
 
 	mu     sync.Mutex
 	conn   *websocket.Conn
 	synced bool // 收到 sync 并补发完成后，事件才实时发送
 
-	execMu  sync.Mutex
-	running string
-	cancel  context.CancelCauseFunc
+	sesMu sync.Mutex
+	ses   *session // 当前持有工作区的测试（同一时间最多一个）
 }
-
-var errCanceled = errors.New("测试被取消")
 
 func New(dir string) (*Agent, error) {
 	cfg, err := LoadConfig(dir)
@@ -56,13 +54,13 @@ func New(dir string) (*Agent, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Agent{dir: dir, cfg: cfg, journal: j, ws: Workspace{Root: dir}}, nil
+	return &Agent{dir: dir, cfg: cfg, journal: j, ws: Workspace{Root: dir}, http: &http.Client{Timeout: 2 * time.Minute}}, nil
 }
 
-// Probe 探测本机信息与 harness。
+// Probe 探测本机信息、harness 与浏览器。
 func Probe(ctx context.Context) protocol.HostInfo {
 	host, _ := os.Hostname()
-	info := protocol.HostInfo{AgentVersion: protocol.Version, Hostname: host, OS: runtime.GOOS, Arch: runtime.GOARCH}
+	info := protocol.HostInfo{AgentVersion: protocol.Version, Protocol: protocol.ProtocolVersion, Hostname: host, OS: runtime.GOOS, Arch: runtime.GOARCH}
 	if out, err := exec.CommandContext(ctx, "git", "--version").Output(); err == nil {
 		info.Git = strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(string(out)), "git version"))
 	}
@@ -79,20 +77,34 @@ func Probe(ctx context.Context) protocol.HostInfo {
 			info.Harnesses[i] = h.Detect(ctx)
 		}()
 	}
+	info.Browser = probeBrowser()
 	wg.Wait()
 	return info
 }
 
 // Run 常驻运行：断线自动重连，直到 ctx 结束。
+// 退出时先在连接仍然可用的情况下收尾当前测试，让后端立即知道测试中断，再断开连接。
 func (a *Agent) Run(ctx context.Context) error {
+	killLeftovers(a.dir)
 	a.recoverInterrupted()
 	go a.housekeeping(ctx)
 
+	connCtx, connCancel := context.WithCancel(context.Background())
+	stopped := make(chan struct{})
+	go func() {
+		defer close(stopped)
+		<-ctx.Done()
+		if s := a.current(); s != nil {
+			a.closeSession(s, protocol.ClosedResult{Error: "agent 正在退出，测试中断"}, false)
+		}
+		connCancel()
+	}()
+
 	backoff := time.Second
-	for ctx.Err() == nil {
+	for connCtx.Err() == nil {
 		start := time.Now()
-		err := a.session(ctx)
-		if ctx.Err() != nil {
+		err := a.session(connCtx)
+		if connCtx.Err() != nil {
 			break
 		}
 		if time.Since(start) > time.Minute {
@@ -101,26 +113,22 @@ func (a *Agent) Run(ctx context.Context) error {
 		wait := backoff + time.Duration(rand.Int64N(int64(backoff/2+1)))
 		log.Printf("与后端的连接断开: %v；%s 后重连", err, wait.Round(time.Second))
 		select {
-		case <-ctx.Done():
+		case <-connCtx.Done():
 		case <-time.After(wait):
 		}
 		backoff = min(backoff*2, time.Minute)
 	}
-	a.execMu.Lock()
-	if a.cancel != nil {
-		a.cancel(errors.New("agent 正在退出"))
-	}
-	a.execMu.Unlock()
+	<-stopped
 	return ctx.Err()
 }
 
-// recoverInterrupted 给上次进程退出时没有结果的测试补写 error 结果。
+// recoverInterrupted 给上次进程退出时没有收尾的测试补写 closed 事件。
 func (a *Agent) recoverInterrupted() {
 	for _, id := range a.journal.Runs() {
-		if !a.journal.Finished(id) {
+		if !a.journal.Closed(id) {
 			log.Printf("测试 %s 在 agent 重启前未完成，标记为中断", id)
-			_, _ = a.journal.Append(protocol.Event{RunID: id, Kind: protocol.KindResult,
-				Result: &protocol.RunResult{Status: "error", Error: "agent 进程重启，测试中断"}})
+			_, _ = a.journal.Append(protocol.Event{RunID: id, Kind: protocol.KindClosed,
+				Closed: &protocol.ClosedResult{Error: "agent 进程重启，测试中断"}})
 		}
 	}
 }
@@ -129,9 +137,10 @@ func (a *Agent) housekeeping(ctx context.Context) {
 	t := time.NewTicker(time.Hour)
 	defer t.Stop()
 	for {
-		a.execMu.Lock()
-		active := a.running
-		a.execMu.Unlock()
+		active := ""
+		if s := a.current(); s != nil {
+			active = s.runID
+		}
 		a.ws.GC(ctx, keepFailed, active)
 		a.journal.Prune(keepJournal)
 		select {
@@ -142,6 +151,20 @@ func (a *Agent) housekeeping(ctx context.Context) {
 	}
 }
 
+func (a *Agent) current() *session {
+	a.sesMu.Lock()
+	defer a.sesMu.Unlock()
+	return a.ses
+}
+
+func (a *Agent) sessionFor(runID string) *session {
+	if s := a.current(); s != nil && s.runID == runID {
+		return s
+	}
+	return nil
+}
+
+// session 维持一次 WebSocket 连接。
 func (a *Agent) session(ctx context.Context) error {
 	dctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	conn, resp, err := websocket.Dial(dctx, wsURL(a.cfg.Server), &websocket.DialOptions{
@@ -172,10 +195,10 @@ func (a *Agent) session(ctx context.Context) error {
 		a.mu.Unlock()
 	}()
 
-	a.execMu.Lock()
-	running := a.running
-	a.execMu.Unlock()
-	hello := protocol.Hello{Type: protocol.TypeHello, Host: Probe(sctx), KnownRuns: a.journal.Runs(), Running: running}
+	hello := protocol.Hello{Type: protocol.TypeHello, Host: Probe(sctx), KnownRuns: a.journal.Runs()}
+	if s := a.current(); s != nil {
+		hello.Active = s.runID
+	}
 	if err := a.write(sctx, conn, hello); err != nil {
 		return err
 	}
@@ -201,6 +224,12 @@ func (a *Agent) write(ctx context.Context, conn *websocket.Conn, v any) error {
 	return conn.Write(ctx, websocket.MessageText, b)
 }
 
+func decodeAs[T any](data []byte) (T, error) {
+	var v T
+	err := json.Unmarshal(data, &v)
+	return v, err
+}
+
 func (a *Agent) handle(ctx context.Context, conn *websocket.Conn, data []byte) error {
 	var env protocol.Envelope
 	if err := json.Unmarshal(data, &env); err != nil {
@@ -208,28 +237,36 @@ func (a *Agent) handle(ctx context.Context, conn *websocket.Conn, data []byte) e
 	}
 	switch env.Type {
 	case protocol.TypeSync:
-		var m protocol.Sync
-		if err := json.Unmarshal(data, &m); err != nil {
+		m, err := decodeAs[protocol.Sync](data)
+		if err != nil {
 			return err
 		}
 		return a.onSync(ctx, conn, m)
 	case protocol.TypeStart:
-		var m protocol.Start
-		if err := json.Unmarshal(data, &m); err != nil {
+		m, err := decodeAs[protocol.Start](data)
+		if err != nil {
 			return err
 		}
 		a.onStart(m)
-	case protocol.TypeCancel:
-		var m protocol.Cancel
-		if err := json.Unmarshal(data, &m); err != nil {
+	case protocol.TypeStage:
+		m, err := decodeAs[protocol.Stage](data)
+		if err != nil {
 			return err
 		}
-		a.execMu.Lock()
-		if a.running == m.RunID && a.cancel != nil {
-			log.Printf("收到取消：%s", m.RunID)
-			a.cancel(errCanceled)
+		a.onStage(m)
+	case protocol.TypeFinish:
+		m, err := decodeAs[protocol.Finish](data)
+		if err != nil {
+			return err
 		}
-		a.execMu.Unlock()
+		a.onEnd(m.RunID, protocol.ClosedResult{})
+	case protocol.TypeCancel:
+		m, err := decodeAs[protocol.Cancel](data)
+		if err != nil {
+			return err
+		}
+		log.Printf("收到取消：%s", m.RunID)
+		a.onEnd(m.RunID, protocol.ClosedResult{Canceled: true})
 	case protocol.TypeProbe:
 		go func() {
 			info := Probe(ctx)
@@ -291,116 +328,8 @@ func (a *Agent) emit(ev protocol.Event) {
 	}
 }
 
-func (a *Agent) onStart(m protocol.Start) {
-	a.execMu.Lock()
-	defer a.execMu.Unlock()
-	if a.running != "" {
-		if a.running == m.RunID {
-			return
-		}
-		a.emit(protocol.Event{RunID: m.RunID, Kind: protocol.KindResult,
-			Result: &protocol.RunResult{Status: "error", Error: "运行时正忙（正在执行 " + a.running + "）"}})
-		return
+func (a *Agent) logger(runID, stageID string) func(string) {
+	return func(s string) {
+		a.emit(protocol.Event{RunID: runID, Kind: protocol.KindLog, StageID: stageID, Text: s})
 	}
-	if a.journal.Finished(m.RunID) {
-		return // 已执行过，结果会通过 sync 补发
-	}
-	ctx, cancel := context.WithCancelCause(context.Background())
-	a.running, a.cancel = m.RunID, cancel
-	go func() {
-		defer func() {
-			a.execMu.Lock()
-			a.running, a.cancel = "", nil
-			a.execMu.Unlock()
-			cancel(nil)
-		}()
-		a.execute(ctx, m)
-	}()
-}
-
-func (a *Agent) execute(ctx context.Context, m protocol.Start) {
-	logf := func(s string) {
-		a.emit(protocol.Event{RunID: m.RunID, Kind: protocol.KindLog, Text: s})
-	}
-	finish := func(res protocol.RunResult) {
-		a.emit(protocol.Event{RunID: m.RunID, Kind: protocol.KindResult, Result: &res})
-		log.Printf("测试 %s 结束：%s %s", m.RunID, res.Status, res.Error)
-	}
-	log.Printf("开始测试 %s：%s@%s via %s", m.RunID, m.RepoURL, m.Branch, m.Harness)
-	a.emit(protocol.Event{RunID: m.RunID, Kind: protocol.KindAccepted})
-
-	h, ok := harness.Get(m.Harness)
-	if !ok {
-		finish(protocol.RunResult{Status: "error", Error: "agent 不支持 harness: " + m.Harness})
-		return
-	}
-	timeout := time.Duration(m.TimeoutMinutes) * time.Minute
-	if timeout <= 0 {
-		timeout = time.Hour
-	}
-	ctx, cancelTimeout := context.WithTimeoutCause(ctx, timeout, fmt.Errorf("超过时限 %s", timeout))
-	defer cancelTimeout()
-
-	statusFor := func(err error) protocol.RunResult {
-		cause := context.Cause(ctx)
-		if errors.Is(cause, errCanceled) {
-			return protocol.RunResult{Status: "canceled", Error: "测试被取消"}
-		}
-		if cause != nil {
-			return protocol.RunResult{Status: "error", Error: cause.Error()}
-		}
-		return protocol.RunResult{Status: "error", Error: err.Error()}
-	}
-
-	a.emit(protocol.Event{RunID: m.RunID, Kind: protocol.KindPhase, Phase: "preparing"})
-	prep, err := a.ws.Prepare(ctx, m.RunID, m.RepoURL, m.Branch, logf)
-	if err != nil {
-		logf("❌ 准备工作区失败: " + err.Error())
-		res := statusFor(err)
-		if prep != nil {
-			prep.Remove(context.Background())
-		}
-		finish(res)
-		return
-	}
-	a.emit(protocol.Event{RunID: m.RunID, Kind: protocol.KindCommit, Commit: prep.Commit})
-	a.emit(protocol.Event{RunID: m.RunID, Kind: protocol.KindPhase, Phase: "running"})
-	logf(fmt.Sprintf("工作目录 %s，启动 %s", prep.Dir, h.Name()))
-
-	tmp := a.ws.TempDir(m.RunID)
-	out, runErr := h.Run(ctx, harness.RunSpec{
-		Dir: prep.Dir, TempDir: tmp, Prompt: m.Prompt, Schema: m.Schema, Log: logf,
-		Env: []string{"VERDICT_RUN_ID=" + m.RunID, "COMPOSE_PROJECT_NAME=verdict-" + m.RunID},
-	})
-
-	cleanCtx, cancelClean := context.WithTimeout(context.Background(), 3*time.Minute)
-	defer cancelClean()
-	composeDown(cleanCtx, m.RunID, logf)
-	modified, diff := prep.Changes(cleanCtx)
-	if modified {
-		logf("⚠ 测试过程中被测源码发生了改动，已记录 diff")
-	}
-
-	var res protocol.RunResult
-	if runErr != nil {
-		res = statusFor(runErr)
-		logf("❌ " + res.Error)
-	} else {
-		res = protocol.RunResult{Status: "completed", Raw: out.Structured}
-		var rep protocol.Report
-		if err := json.Unmarshal(out.Structured, &rep); err != nil {
-			res = protocol.RunResult{Status: "error", Error: "harness 输出不符合结果结构: " + err.Error(), Raw: out.Structured}
-		} else {
-			res.Report = &rep
-		}
-	}
-	res.CostUSD, res.SourceModified, res.Diff = out.CostUSD, modified, diff
-
-	_ = os.RemoveAll(tmp)
-	if res.Status == "completed" {
-		prep.Remove(cleanCtx)
-	} else {
-		logf(fmt.Sprintf("工作目录保留 %s 供排查：%s", keepFailed, prep.Dir))
-	}
-	finish(res)
 }
