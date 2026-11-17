@@ -1,0 +1,12 @@
+data/
+bin/
+web/node_modules/
+web/dist/
+
+# env / local
+.env
+.env.*
+*.log
+.DS_Store
+.idea/
+.vscode/
