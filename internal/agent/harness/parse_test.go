@@ -1,6 +1,7 @@
 package harness
 
 import (
+	"os"
 	"strings"
 	"testing"
 )
@@ -47,5 +48,25 @@ func TestCodexLine(t *testing.T) {
 		if !strings.Contains(all, want) {
 			t.Errorf("日志缺少 %q:\n%s", want, all)
 		}
+	}
+}
+
+func TestCodexMCPArgs(t *testing.T) {
+	args := codexMCPArgs(&MCPServer{Name: "playwright", Command: "npx", Args: []string{"-y", "@playwright/mcp@0.0.84", "--output-dir", `/tmp/a "b"`}})
+	want := []string{"-c", `mcp_servers.playwright.command="npx"`, "-c", `mcp_servers.playwright.args=["-y","@playwright/mcp@0.0.84","--output-dir","/tmp/a \"b\""]`, "-c", "mcp_servers.playwright.startup_timeout_sec=120"}
+	if strings.Join(args, "\n") != strings.Join(want, "\n") {
+		t.Fatalf("got %q", args)
+	}
+}
+
+func TestClaudeMCPConfig(t *testing.T) {
+	dir := t.TempDir()
+	p, err := claudeMCPConfig(RunSpec{TempDir: dir, MCP: &MCPServer{Name: "playwright", Command: "npx", Args: []string{"-y", "x"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, _ := os.ReadFile(p)
+	if !strings.Contains(string(b), `"mcpServers":{"playwright":{"args":["-y","x"],"command":"npx","type":"stdio"}}`) {
+		t.Fatalf("配置不对: %s", b)
 	}
 }

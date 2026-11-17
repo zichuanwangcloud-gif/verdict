@@ -3,7 +3,7 @@ import { ref, computed, onMounted, onUnmounted } from 'vue'
 import { Plus, Sparkles, Activity, CircleCheck, CircleX, ListChecks, GitCommitHorizontal } from 'lucide-vue-next'
 import { api } from '../api'
 import { go } from '../router'
-import { fmtTime, fmtDuration, harnessName, isLive, ago } from '../format'
+import { fmtTime, fmtDuration, harnessName, isLive, ago, tierMeta } from '../format'
 import StatusPill from '../components/StatusPill.vue'
 import AcBar from '../components/AcBar.vue'
 import HarnessLogo from '../components/HarnessLogo.vue'
@@ -97,8 +97,11 @@ const stats = computed(() => {
             <AcBar :acs="r.acs" />
           </div>
           <div class="run-main" style="min-width: 0">
-            <div class="run-title"><span class="issue-key">{{ r.issue_key }}</span>{{ r.issue.title }}</div>
-            <div class="run-sub">{{ r.summary || r.error || (isLive(r) ? 'agent 正在测试…' : '') }}</div>
+            <div class="run-title">
+              <span v-if="r.tier" class="tier-tag sm" :class="'tier-' + (tierMeta[r.tier]?.tone || 'custom')" style="margin-right: 6px">{{ tierMeta[r.tier]?.short }}</span>
+              <span class="issue-key">{{ r.issue_key }}</span>{{ r.issue.title }}
+            </div>
+            <div class="run-sub">{{ r.status === 'awaiting_approval' ? '测试计划已生成，等待你确认' : r.summary || r.error || (isLive(r) ? 'agent 正在测试…' : '') }}</div>
           </div>
           <div class="run-meta hide-sm">
             <span class="row" style="gap: 6px"><GitCommitHorizontal :size="13" /> {{ r.repo_name }}</span>

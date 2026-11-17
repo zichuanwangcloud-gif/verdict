@@ -1,12 +1,13 @@
 <script setup>
 import { ref, onMounted } from 'vue'
-import { Plus, GitBranch, PencilLine, Trash2, NotebookPen, KeyRound, Sparkles, X } from 'lucide-vue-next'
+import { Plus, GitBranch, PencilLine, Trash2, NotebookPen, KeyRound, Sparkles, X, Rocket, Package, HeartPulse, Globe } from 'lucide-vue-next'
 import { api } from '../api'
 
 const list = ref([])
 const err = ref('')
 const adding = ref(false)
-const form = ref({ url: '', name: '', test_notes: '' })
+const blank = () => ({ url: '', name: '', test_notes: '', setup_cmd: '', start_cmd: '', health_url: '', app_url: '' })
+const form = ref(blank())
 const editing = ref(null)
 
 async function load() {
@@ -22,7 +23,7 @@ async function add() {
   err.value = ''
   try {
     await api.createRepo(form.value)
-    form.value = { url: '', name: '', test_notes: '' }
+    form.value = blank()
     adding.value = false
     load()
   } catch (e) {
@@ -93,6 +94,26 @@ const notesPlaceholder = '交给 agent 的测试说明：\n- 怎么安装依赖�
           <input v-model="form.name" placeholder="可选，默认取 org/repo" />
         </div>
       </div>
+      <div class="label row" style="gap: 6px"><Rocket :size="12" /> 运行方式（可选，B 档及以上由 agent 托管启动）</div>
+      <div class="grid-2">
+        <div class="field">
+          <label>安装依赖</label>
+          <input v-model="form.setup_cmd" class="mono" placeholder="pnpm install" />
+        </div>
+        <div class="field">
+          <label>启动命令（前台运行）</label>
+          <input v-model="form.start_cmd" class="mono" placeholder="pnpm dev --port 3000" />
+        </div>
+        <div class="field">
+          <label>健康检查地址</label>
+          <input v-model="form.health_url" class="mono" placeholder="http://127.0.0.1:3000/health" />
+        </div>
+        <div class="field">
+          <label>前端入口地址（UI 走查）</label>
+          <input v-model="form.app_url" class="mono" placeholder="http://127.0.0.1:3000" />
+        </div>
+      </div>
+      <span class="hint">留空时由计划阶段的 agent 根据代码推断。启动命令不要加 &amp; 或 nohup。</span>
       <div class="field">
         <label>测试说明</label>
         <textarea v-model="form.test_notes" rows="6" :placeholder="notesPlaceholder" />
@@ -114,6 +135,26 @@ const notesPlaceholder = '交给 agent 的测试说明：\n- 怎么安装依赖�
           <div class="field"><label>git 地址</label><input v-model="editing.url" class="mono" /></div>
           <div class="field"><label>显示名称</label><input v-model="editing.name" /></div>
         </div>
+      <div class="label row" style="gap: 6px"><Rocket :size="12" /> 运行方式（可选，B 档及以上由 agent 托管启动）</div>
+      <div class="grid-2">
+        <div class="field">
+          <label>安装依赖</label>
+          <input v-model="editing.setup_cmd" class="mono" placeholder="pnpm install" />
+        </div>
+        <div class="field">
+          <label>启动命令（前台运行）</label>
+          <input v-model="editing.start_cmd" class="mono" placeholder="pnpm dev --port 3000" />
+        </div>
+        <div class="field">
+          <label>健康检查地址</label>
+          <input v-model="editing.health_url" class="mono" placeholder="http://127.0.0.1:3000/health" />
+        </div>
+        <div class="field">
+          <label>前端入口地址（UI 走查）</label>
+          <input v-model="editing.app_url" class="mono" placeholder="http://127.0.0.1:3000" />
+        </div>
+      </div>
+      <span class="hint">留空时由计划阶段的 agent 根据代码推断。启动命令不要加 &amp; 或 nohup。</span>
         <div class="field"><label>测试说明</label><textarea v-model="editing.test_notes" rows="8" :placeholder="notesPlaceholder" /></div>
         <div class="row">
           <button class="btn primary" @click="save">保存</button>
@@ -133,6 +174,12 @@ const notesPlaceholder = '交给 agent 的测试说明：\n- 怎么安装依赖�
             <button class="btn ghost icon" title="编辑" @click="editing = { ...r }"><PencilLine :size="15" /></button>
             <button class="btn ghost icon danger" title="删除" @click="remove(r)"><Trash2 :size="15" /></button>
           </div>
+        </div>
+        <div v-if="r.start_cmd || r.setup_cmd || r.health_url || r.app_url" class="meta-chips">
+          <span v-if="r.setup_cmd" class="chip"><Package /> <span class="mono">{{ r.setup_cmd }}</span></span>
+          <span v-if="r.start_cmd" class="chip"><Rocket /> <span class="mono">{{ r.start_cmd }}</span></span>
+          <span v-if="r.health_url" class="chip"><HeartPulse /> <span class="mono">{{ r.health_url }}</span></span>
+          <span v-if="r.app_url" class="chip"><Globe /> <span class="mono">{{ r.app_url }}</span></span>
         </div>
         <div>
           <div class="label row" style="gap: 6px; margin-bottom: 6px"><NotebookPen :size="12" /> 测试说明</div>

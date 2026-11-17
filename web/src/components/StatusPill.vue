@@ -1,6 +1,6 @@
 <script setup>
 import { computed } from 'vue'
-import { CircleCheck, CircleX, CircleAlert, Loader, Ban, Clock, TriangleAlert } from 'lucide-vue-next'
+import { CircleCheck, CircleX, CircleAlert, Loader, Ban, Clock, TriangleAlert, Hand } from 'lucide-vue-next'
 import { runTone, runLabel } from '../format'
 
 const props = defineProps({ run: Object, large: Boolean })
@@ -11,9 +11,10 @@ const icon = computed(() => {
   if (r.status === 'error') return TriangleAlert
   if (r.status === 'canceled') return Ban
   if (r.status === 'queued') return Clock
+  if (r.status === 'awaiting_approval') return Hand
   return Loader
 })
-const live = computed(() => ['dispatched', 'preparing', 'running'].includes(props.run.status))
+const live = computed(() => ['dispatched', 'preparing', 'running', 'finalizing'].includes(props.run.status))
 </script>
 
 <template>

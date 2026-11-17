@@ -26,12 +26,20 @@ type Output struct {
 // LogFunc 接收一行可读日志。
 type LogFunc func(string)
 
+// MCPServer 是挂载给 harness 的一个 stdio MCP 服务（例如无头浏览器）。
+type MCPServer struct {
+	Name    string
+	Command string
+	Args    []string
+}
+
 type RunSpec struct {
 	Dir     string // 工作目录（被测代码）
 	TempDir string // 适配器可用的临时目录（在工作目录之外）
 	Prompt  string
 	Schema  json.RawMessage
-	Env     []string // 追加的环境变量
+	Env     []string   // 追加的环境变量
+	MCP     *MCPServer // 可选：本阶段挂载的 MCP 服务
 	Log     LogFunc
 }
 

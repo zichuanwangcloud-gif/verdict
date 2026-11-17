@@ -15,14 +15,11 @@ import (
 
 	"verdict/internal/protocol"
 	"verdict/internal/server/store"
-	"verdict/internal/testplan"
 )
 
 const (
 	pingInterval = 30 * time.Second
 	pingTimeout  = 15 * time.Second
-	// watchdog 宽限：agent 自己会执行超时，这里只兜底「运行时一去不回」的情况。
-	watchdogGrace = 15 * time.Minute
 )
 
 type agentConn struct {
@@ -30,6 +27,8 @@ type agentConn struct {
 	ws        *websocket.Conn
 	writeMu   sync.Mutex
 	cancel    context.CancelFunc
+	// compatible 在收到 hello 后确定：协议版本不一致的 agent 不派发任务。
+	compatible bool
 }
 
 func (c *agentConn) send(ctx context.Context, v any) error {
@@ -44,7 +43,7 @@ func (c *agentConn) send(ctx context.Context, v any) error {
 	return c.ws.Write(ctx, websocket.MessageText, b)
 }
 
-// Hub 管理全部 agent 连接，并负责把排队的测试派给空闲的运行时。
+// Hub 管理全部 agent 连接；测试的推进逻辑在 orchestrator.go。
 type Hub struct {
 	st *store.Store
 	// OnFinish 在测试进入终态后调用（回写 Linear 等），在独立 goroutine 中执行。
@@ -54,6 +53,8 @@ type Hub struct {
 	conns map[int64]*agentConn
 	// schedMu 串行化调度，避免同一运行时被重复派单。
 	schedMu sync.Mutex
+	// advMu 串行化测试推进，避免同一个测试被重复创建阶段。
+	advMu sync.Mutex
 }
 
 func NewHub(st *store.Store) *Hub {
@@ -61,16 +62,22 @@ func NewHub(st *store.Store) *Hub {
 }
 
 func (h *Hub) Online(runtimeID int64) bool {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	_, ok := h.conns[runtimeID]
-	return ok
+	return h.conn(runtimeID) != nil
 }
 
 func (h *Hub) conn(runtimeID int64) *agentConn {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	return h.conns[runtimeID]
+}
+
+// usable 返回可以派发任务的连接。
+func (h *Hub) usable(runtimeID int64) *agentConn {
+	c := h.conn(runtimeID)
+	if c == nil || !c.compatible {
+		return nil
+	}
+	return c
 }
 
 // Disconnect 断开某运行时的连接（例如运行时被删除）。
@@ -100,7 +107,7 @@ func (h *Hub) ServeWS(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		return
 	}
-	ws.SetReadLimit(8 << 20)
+	ws.SetReadLimit(16 << 20)
 	ctx, cancel := context.WithCancel(context.Background())
 	c := &agentConn{runtimeID: rt.ID, ws: ws, cancel: cancel}
 
@@ -177,6 +184,9 @@ func (h *Hub) handle(ctx context.Context, c *agentConn, data []byte) error {
 		}
 		return h.st.UpdateRuntimeInfo(ctx, c.runtimeID, m.Host)
 	case protocol.TypeEvent:
+		if !c.compatible {
+			return nil
+		}
 		var m protocol.Event
 		if err := json.Unmarshal(data, &m); err != nil {
 			return err
@@ -191,11 +201,18 @@ func (h *Hub) onHello(ctx context.Context, c *agentConn, m protocol.Hello) error
 	if err := h.st.UpdateRuntimeInfo(ctx, c.runtimeID, m.Host); err != nil {
 		return err
 	}
-	active, err := h.st.RunsOnRuntime(ctx, c.runtimeID, store.StatusDispatched, store.StatusPreparing, store.StatusRunning)
+	if m.Host.Protocol != protocol.ProtocolVersion {
+		log.Printf("运行时 #%d 的 agent 协议版本 %d 与后端 %d 不一致，不派发任务", c.runtimeID, m.Host.Protocol, protocol.ProtocolVersion)
+		return nil
+	}
+	c.compatible = true
+
+	active, err := h.st.RunsOnRuntime(ctx, c.runtimeID, store.ActiveStatuses...)
 	if err != nil {
 		return err
 	}
 	sync := protocol.Sync{Type: protocol.TypeSync, Runs: []protocol.SyncRun{}}
+	var resume []string
 	for _, r := range active {
 		if slices.Contains(m.KnownRuns, r.ID) {
 			last, err := h.st.LastSeq(ctx, r.ID)
@@ -203,28 +220,30 @@ func (h *Hub) onHello(ctx context.Context, c *agentConn, m protocol.Hello) error
 				return err
 			}
 			sync.Runs = append(sync.Runs, protocol.SyncRun{RunID: r.ID, LastSeq: last})
+			resume = append(resume, r.ID)
 			continue
 		}
 		if r.Status == store.StatusDispatched {
 			// agent 从未收到这条任务，重新排队。
-			_, err = h.st.SetStatus(ctx, r.ID, store.StatusQueued, "", store.StatusDispatched)
-		} else {
-			if ok, _ := h.st.SetStatus(ctx, r.ID, store.StatusError, "运行时丢失了这次测试（agent 数据目录被清理或更换了机器）", r.Status); ok {
-				h.finished(r.ID)
+			if _, err := h.st.SetStatus(ctx, r.ID, store.StatusQueued, "", store.StatusDispatched); err != nil {
+				return err
 			}
+			continue
 		}
-		if err != nil {
-			return err
-		}
+		h.closeRun(ctx, r.ID, store.StatusError, "运行时丢失了这次测试（agent 数据目录被清理或更换了机器）", protocol.ClosedResult{})
 	}
 	if err := c.send(ctx, sync); err != nil {
 		return err
 	}
-	// agent 仍在执行、但平台上已结束（例如离线期间被取消）的测试，通知它停下。
-	if m.Running != "" {
-		if r, err := h.st.Run(ctx, m.Running); err == nil && store.Terminal(r.Status) {
+	// agent 仍持有工作区、但平台上已结束（例如离线期间被取消）的测试，通知它收尾。
+	if m.Active != "" {
+		if r, err := h.st.Run(ctx, m.Active); err == nil && store.Terminal(r.Status) {
 			_ = c.send(ctx, protocol.Cancel{Type: protocol.TypeCancel, RunID: r.ID})
 		}
+	}
+	// sync 之后推进：需要重发的阶段会被 agent 按 stage_id 去重。
+	for _, id := range resume {
+		go h.Advance(id)
 	}
 	go h.Schedule(c.runtimeID)
 	return nil
@@ -245,54 +264,89 @@ func (h *Hub) onEvent(ctx context.Context, c *agentConn, ev protocol.Event) erro
 	if ev.Seq <= last {
 		return nil // 重复事件
 	}
+	advance := false
 	switch ev.Kind {
 	case protocol.KindAccepted:
 		_, err = h.st.SetStatus(ctx, run.ID, store.StatusPreparing, "", store.StatusDispatched, store.StatusQueued)
-	case protocol.KindPhase:
-		switch ev.Phase {
-		case store.StatusPreparing:
-			_, err = h.st.SetStatus(ctx, run.ID, store.StatusPreparing, "", store.StatusDispatched, store.StatusQueued)
-		case store.StatusRunning:
+	case protocol.KindReady:
+		if err = h.st.SetCommit(ctx, run.ID, ev.Commit); err == nil {
 			_, err = h.st.SetStatus(ctx, run.ID, store.StatusRunning, "", store.StatusDispatched, store.StatusQueued, store.StatusPreparing)
+			advance = true
 		}
-	case protocol.KindCommit:
-		err = h.st.SetCommit(ctx, run.ID, ev.Commit)
+	case protocol.KindStageStarted:
+		if err = h.st.MarkStage(ctx, ev.StageID, "running"); err == nil {
+			err = h.st.SetCurrentStage(ctx, run.ID, ev.StageID)
+		}
 	case protocol.KindLog:
-		err = h.st.AppendLog(ctx, run.ID, ev.Seq, ev.TS, ev.Text)
-	case protocol.KindResult:
-		if ev.Result == nil {
-			return errors.New("result 事件缺少结果")
+		err = h.st.AppendLog(ctx, run.ID, ev.StageID, ev.Seq, ev.TS, ev.Text)
+	case protocol.KindStageResult:
+		if ev.Stage == nil {
+			return errors.New("stage_result 事件缺少结果")
 		}
-		var ok bool
-		ok, err = h.st.Finish(ctx, run.ID, *ev.Result)
-		if ok {
-			h.finished(run.ID)
+		if _, err = h.st.FinishStage(ctx, ev.StageID, *ev.Stage); err == nil {
+			err = h.refreshResult(ctx, run)
+			advance = true
 		}
-		go h.Schedule(c.runtimeID)
+	case protocol.KindClosed:
+		if ev.Closed == nil {
+			return errors.New("closed 事件缺少结果")
+		}
+		h.onClosed(ctx, run, *ev.Closed)
 	}
 	if err != nil {
 		return err
 	}
-	_, err = h.st.AcceptSeq(ctx, run.ID, ev.Seq)
-	return err
+	if _, err = h.st.AcceptSeq(ctx, run.ID, ev.Seq); err != nil {
+		return err
+	}
+	if advance {
+		go h.Advance(run.ID)
+	}
+	return nil
 }
 
-func (h *Hub) finished(runID string) {
-	if h.OnFinish != nil {
-		go h.OnFinish(runID)
+func (h *Hub) onClosed(ctx context.Context, run store.Run, c protocol.ClosedResult) {
+	status, msg := store.StatusCompleted, ""
+	switch {
+	case c.Canceled:
+		status, msg = store.StatusCanceled, "测试被取消"
+	case c.Error != "":
+		status, msg = store.StatusError, c.Error
+	case run.Status != store.StatusFinalizing:
+		status, msg = store.StatusError, "运行时在测试完成前结束了工作区"
+	case run.Error != "":
+		status = store.StatusError // 流水线致命错误，原因已在进入收尾时写入
+	}
+	h.closeRun(ctx, run.ID, status, msg, c)
+	go h.Schedule(run.RuntimeID)
+}
+
+// closeRun 写入终态并触发回写。
+func (h *Hub) closeRun(ctx context.Context, runID, status, msg string, c protocol.ClosedResult) {
+	_ = h.st.CancelOpenStages(ctx, runID)
+	ok, err := h.st.CloseRun(ctx, runID, status, msg, c)
+	if err != nil {
+		log.Printf("测试 %s 写入终态失败: %v", runID, err)
+		return
+	}
+	if ok {
+		log.Printf("测试 %s 结束：%s %s", runID, status, msg)
+		if h.OnFinish != nil {
+			go h.OnFinish(runID)
+		}
 	}
 }
 
-// Schedule 在运行时在线且空闲时，派发最早排队的测试。
+// Schedule 在运行时在线、版本兼容且空闲时，派发最早排队的测试。
 func (h *Hub) Schedule(runtimeID int64) {
 	h.schedMu.Lock()
 	defer h.schedMu.Unlock()
-	c := h.conn(runtimeID)
+	c := h.usable(runtimeID)
 	if c == nil {
 		return
 	}
 	ctx := context.Background()
-	busy, err := h.st.RunsOnRuntime(ctx, runtimeID, store.StatusDispatched, store.StatusPreparing, store.StatusRunning)
+	busy, err := h.st.RunsOnRuntime(ctx, runtimeID, store.ActiveStatuses...)
 	if err != nil || len(busy) > 0 {
 		return
 	}
@@ -305,45 +359,13 @@ func (h *Hub) Schedule(runtimeID int64) {
 	if err != nil || !ok {
 		return
 	}
-	msg := protocol.Start{
-		Type: protocol.TypeStart, RunID: r.ID, RepoURL: r.RepoURL, Branch: r.Branch, Harness: r.Harness,
-		Prompt: r.Prompt, Schema: testplan.Schema, TimeoutMinutes: r.TimeoutMinutes,
-	}
+	msg := protocol.Start{Type: protocol.TypeStart, RunID: r.ID, RepoURL: r.RepoURL, Branch: r.Branch}
 	if err := c.send(ctx, msg); err != nil {
 		log.Printf("下发测试 %s 失败: %v", r.ID, err)
 		_, _ = h.st.SetStatus(ctx, r.ID, store.StatusQueued, "", store.StatusDispatched)
 		return
 	}
 	log.Printf("测试 %s 已下发到运行时 #%d", r.ID, runtimeID)
-}
-
-// Cancel 取消测试。排队中的直接取消；执行中的通知 agent，离线时直接标记。
-func (h *Hub) Cancel(ctx context.Context, run store.Run) error {
-	if store.Terminal(run.Status) {
-		return errors.New("测试已结束")
-	}
-	if run.Status == store.StatusQueued {
-		ok, err := h.st.SetStatus(ctx, run.ID, store.StatusCanceled, "测试在排队时被取消", store.StatusQueued)
-		if err != nil {
-			return err
-		}
-		if ok {
-			h.finished(run.ID)
-			return nil
-		}
-		// 恰好刚被派发，继续按执行中处理。
-	}
-	if c := h.conn(run.RuntimeID); c != nil {
-		if err := c.send(ctx, protocol.Cancel{Type: protocol.TypeCancel, RunID: run.ID}); err == nil {
-			return nil // agent 停止后会上报 canceled 结果
-		}
-	}
-	ok, err := h.st.SetStatus(ctx, run.ID, store.StatusCanceled, "运行时离线，测试被直接标记为取消",
-		store.StatusQueued, store.StatusDispatched, store.StatusPreparing, store.StatusRunning)
-	if ok {
-		h.finished(run.ID)
-	}
-	return err
 }
 
 // RequestProbe 让在线的运行时重新探测 harness。
@@ -353,47 +375,4 @@ func (h *Hub) RequestProbe(ctx context.Context, runtimeID int64) error {
 		return errors.New("运行时不在线")
 	}
 	return c.send(ctx, protocol.Probe{Type: protocol.TypeProbe})
-}
-
-// Watchdog 定期把「远超超时仍无结果」的测试标记为 error。
-func (h *Hub) Watchdog(ctx context.Context) {
-	t := time.NewTicker(time.Minute)
-	defer t.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-t.C:
-		}
-		rts, err := h.st.Runtimes(ctx)
-		if err != nil {
-			continue
-		}
-		for _, rt := range rts {
-			runs, err := h.st.RunsOnRuntime(ctx, rt.ID, store.StatusDispatched, store.StatusPreparing, store.StatusRunning)
-			if err != nil {
-				continue
-			}
-			for _, r := range runs {
-				start := r.CreatedAt
-				if r.StartedAt != nil {
-					start = r.StartedAt
-				}
-				if start == nil {
-					continue
-				}
-				deadline := start.Add(time.Duration(r.TimeoutMinutes)*time.Minute + watchdogGrace)
-				if time.Now().After(deadline) {
-					if ok, _ := h.st.SetStatus(ctx, r.ID, store.StatusError, "超过时限仍未收到运行时的结果", r.Status); ok {
-						h.finished(r.ID)
-						go h.Schedule(rt.ID)
-					}
-				}
-			}
-			// 顺带：在线运行时如有排队任务则尝试派发（兜底）。
-			if h.Online(rt.ID) {
-				go h.Schedule(rt.ID)
-			}
-		}
-	}
 }

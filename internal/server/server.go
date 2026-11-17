@@ -1,4 +1,4 @@
-// Package server 是 Verdict 后端：REST API、agent WebSocket、调度与 Linear 回写。
+// Package server 是 Verdict 后端：REST API、agent WebSocket、测试编排与 Linear 回写。
 package server
 
 import (
@@ -8,14 +8,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
 	"net/http"
 	"os"
 	"path/filepath"
-	"slices"
 	"strconv"
 	"strings"
-	"time"
 
 	"verdict/internal/linear"
 	"verdict/internal/protocol"
@@ -34,6 +31,7 @@ type Config struct {
 	AdminToken string
 	WebDir     string // 前端构建产物
 	BinDir     string // 供运行时下载的 agent 二进制：verdict-linux-amd64 等
+	DataDir    string // 产物（截图等）存放目录
 }
 
 type Server struct {
@@ -55,21 +53,24 @@ func (s *Server) Handler() http.Handler {
 	api := http.NewServeMux()
 
 	mux.HandleFunc("GET /api/health", func(w http.ResponseWriter, _ *http.Request) {
-		ok(w, map[string]any{"ok": true, "version": protocol.Version})
+		ok(w, map[string]any{"ok": true, "version": protocol.Version, "protocol": protocol.ProtocolVersion})
 	})
 	mux.HandleFunc("GET /api/agent/ws", s.hub.ServeWS)
+	mux.HandleFunc("POST /api/agent/runs/{id}/artifacts", s.uploadArtifact)
 	mux.HandleFunc("GET /install.sh", s.installScript)
 	mux.HandleFunc("GET /download/{file}", s.download)
 
 	api.HandleFunc("GET /api/me", func(w http.ResponseWriter, _ *http.Request) { ok(w, map[string]bool{"ok": true}) })
 	api.HandleFunc("GET /api/settings", s.getSettings)
 	api.HandleFunc("PUT /api/settings", s.putSettings)
+	api.HandleFunc("GET /api/tiers", func(w http.ResponseWriter, _ *http.Request) { ok(w, testplan.Presets()) })
 
 	api.HandleFunc("GET /api/runtimes", s.listRuntimes)
 	api.HandleFunc("POST /api/runtimes", s.createRuntime)
 	api.HandleFunc("PATCH /api/runtimes/{id}", s.renameRuntime)
 	api.HandleFunc("DELETE /api/runtimes/{id}", s.deleteRuntime)
 	api.HandleFunc("POST /api/runtimes/{id}/probe", s.probeRuntime)
+	api.HandleFunc("POST /api/runtimes/{id}/token", s.rotateToken)
 
 	api.HandleFunc("GET /api/repos", s.listRepos)
 	api.HandleFunc("POST /api/repos", s.createRepo)
@@ -83,8 +84,10 @@ func (s *Server) Handler() http.Handler {
 	api.HandleFunc("GET /api/runs/{id}", s.getRun)
 	api.HandleFunc("GET /api/runs/{id}/logs", s.runLogs)
 	api.HandleFunc("POST /api/runs/{id}/cancel", s.cancelRun)
+	api.HandleFunc("POST /api/runs/{id}/approve", s.approveRun)
 	api.HandleFunc("POST /api/runs/{id}/rerun", s.rerun)
 	api.HandleFunc("POST /api/runs/{id}/linear", s.retryWriteBack)
+	api.HandleFunc("GET /api/runs/{id}/artifacts/{name}", s.getArtifact)
 
 	mux.Handle("/api/", s.requireAdmin(api))
 	if s.cfg.WebDir != "" {
@@ -227,21 +230,32 @@ func (s *Server) putSettings(w http.ResponseWriter, r *http.Request) {
 
 // ---- runtimes ----
 
+type runtimeView struct {
+	store.Runtime
+	// Outdated 表示 agent 协议版本与后端不一致，需要重新安装。
+	Outdated bool `json:"outdated"`
+}
+
 func (s *Server) listRuntimes(w http.ResponseWriter, r *http.Request) {
 	rts, err := s.st.Runtimes(r.Context())
 	if err != nil {
 		failErr(w, err)
 		return
 	}
-	out := rts[:0]
+	out := []runtimeView{}
 	for _, rt := range rts {
 		if strings.HasSuffix(rt.Name, "（已删除）") {
 			continue
 		}
 		rt.Online = s.hub.Online(rt.ID)
-		out = append(out, rt)
+		out = append(out, runtimeView{Runtime: rt, Outdated: rt.Info != nil && rt.Info.Protocol != protocol.ProtocolVersion})
 	}
 	ok(w, out)
+}
+
+func (s *Server) installCommand(ctx context.Context, r *http.Request, token string) string {
+	base := s.publicURL(ctx, r)
+	return fmt.Sprintf("curl -fsSL %s/install.sh | sh -s -- --server %s --token %s", base, base, token)
 }
 
 func (s *Server) createRuntime(w http.ResponseWriter, r *http.Request) {
@@ -262,12 +276,7 @@ func (s *Server) createRuntime(w http.ResponseWriter, r *http.Request) {
 		failErr(w, err)
 		return
 	}
-	base := s.publicURL(r.Context(), r)
-	ok(w, map[string]any{
-		"runtime":         rt,
-		"token":           token,
-		"install_command": fmt.Sprintf("curl -fsSL %s/install.sh | sh -s -- --server %s --token %s", base, base, token),
-	})
+	ok(w, map[string]any{"runtime": rt, "token": token, "install_command": s.installCommand(r.Context(), r, token)})
 }
 
 func (s *Server) renameRuntime(w http.ResponseWriter, r *http.Request) {
@@ -304,6 +313,23 @@ func (s *Server) deleteRuntime(w http.ResponseWriter, r *http.Request) {
 	ok(w, map[string]bool{"ok": true})
 }
 
+// rotateToken 重新生成令牌与安装命令（用于升级 agent 或令牌泄露）。旧连接会被断开。
+func (s *Server) rotateToken(w http.ResponseWriter, r *http.Request) {
+	id, err := pathID(r)
+	if err != nil {
+		fail(w, http.StatusBadRequest, "id 无效")
+		return
+	}
+	token, err := s.st.RotateToken(r.Context(), id)
+	if err != nil {
+		failErr(w, err)
+		return
+	}
+	s.hub.Disconnect(id)
+	rt, _ := s.st.Runtime(r.Context(), id)
+	ok(w, map[string]any{"runtime": rt, "token": token, "install_command": s.installCommand(r.Context(), r, token)})
+}
+
 func (s *Server) probeRuntime(w http.ResponseWriter, r *http.Request) {
 	id, err := pathID(r)
 	if err != nil {
@@ -323,21 +349,32 @@ type repoInput struct {
 	URL       string `json:"url"`
 	Name      string `json:"name"`
 	TestNotes string `json:"test_notes"`
+	SetupCmd  string `json:"setup_cmd"`
+	StartCmd  string `json:"start_cmd"`
+	HealthURL string `json:"health_url"`
+	AppURL    string `json:"app_url"`
 }
 
-func (in *repoInput) normalize() error {
+func (in *repoInput) repo(id int64) (store.Repo, error) {
 	in.URL = strings.TrimSpace(in.URL)
 	if in.URL == "" {
-		return errors.New("仓库地址不能为空")
+		return store.Repo{}, errors.New("仓库地址不能为空")
 	}
 	if strings.HasPrefix(in.URL, "-") || strings.ContainsAny(in.URL, " \t\n") {
-		return errors.New("仓库地址不合法")
+		return store.Repo{}, errors.New("仓库地址不合法")
 	}
 	in.Name = strings.TrimSpace(in.Name)
 	if in.Name == "" {
 		in.Name = repoName(in.URL)
 	}
-	return nil
+	for _, u := range []string{in.HealthURL, in.AppURL} {
+		if u = strings.TrimSpace(u); u != "" && !strings.HasPrefix(u, "http://") && !strings.HasPrefix(u, "https://") {
+			return store.Repo{}, errors.New("健康检查地址和前端地址需要以 http:// 或 https:// 开头")
+		}
+	}
+	return store.Repo{ID: id, URL: in.URL, Name: in.Name, TestNotes: in.TestNotes,
+		SetupCmd: strings.TrimSpace(in.SetupCmd), StartCmd: strings.TrimSpace(in.StartCmd),
+		HealthURL: strings.TrimSpace(in.HealthURL), AppURL: strings.TrimSpace(in.AppURL)}, nil
 }
 
 func repoName(url string) string {
@@ -367,11 +404,12 @@ func (s *Server) createRepo(w http.ResponseWriter, r *http.Request) {
 		fail(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	if err := in.normalize(); err != nil {
+	repo, err := in.repo(0)
+	if err != nil {
 		fail(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	repo, err := s.st.CreateRepo(r.Context(), in.URL, in.Name, in.TestNotes)
+	created, err := s.st.CreateRepo(r.Context(), repo)
 	if err != nil {
 		if strings.Contains(err.Error(), "UNIQUE") {
 			fail(w, http.StatusConflict, "该仓库已存在")
@@ -380,7 +418,7 @@ func (s *Server) createRepo(w http.ResponseWriter, r *http.Request) {
 		failErr(w, err)
 		return
 	}
-	ok(w, repo)
+	ok(w, created)
 }
 
 func (s *Server) updateRepo(w http.ResponseWriter, r *http.Request) {
@@ -394,20 +432,21 @@ func (s *Server) updateRepo(w http.ResponseWriter, r *http.Request) {
 		fail(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	if err := in.normalize(); err != nil {
+	repo, err := in.repo(id)
+	if err != nil {
 		fail(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	if err := s.st.UpdateRepo(r.Context(), id, in.URL, in.Name, in.TestNotes); err != nil {
+	if err := s.st.UpdateRepo(r.Context(), repo); err != nil {
 		failErr(w, err)
 		return
 	}
-	repo, err := s.st.Repo(r.Context(), id)
+	updated, err := s.st.Repo(r.Context(), id)
 	if err != nil {
 		failErr(w, err)
 		return
 	}
-	ok(w, repo)
+	ok(w, updated)
 }
 
 func (s *Server) deleteRepo(w http.ResponseWriter, r *http.Request) {
@@ -432,264 +471,6 @@ func (s *Server) previewIssue(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	ok(w, is)
-}
-
-// ---- runs ----
-
-func (s *Server) listRuns(w http.ResponseWriter, r *http.Request) {
-	runs, err := s.st.Runs(r.Context(), 200)
-	if err != nil {
-		failErr(w, err)
-		return
-	}
-	ok(w, runs)
-}
-
-type runInput struct {
-	IssueKey string `json:"issue_key"`
-	// ManualIssue 在不使用 Linear 时手动提供需求（不会回写）。
-	ManualIssue *struct {
-		Title       string `json:"title"`
-		Description string `json:"description"`
-	} `json:"manual_issue"`
-	RepoID         int64  `json:"repo_id"`
-	Branch         string `json:"branch"`
-	RuntimeID      int64  `json:"runtime_id"`
-	Harness        string `json:"harness"`
-	TimeoutMinutes int    `json:"timeout_minutes"`
-}
-
-func validBranch(b string) bool {
-	return b != "" && !strings.HasPrefix(b, "-") && !strings.ContainsAny(b, " \t\n~^:?*[\\") && !strings.Contains(b, "..")
-}
-
-func (s *Server) createRun(w http.ResponseWriter, r *http.Request) {
-	var in runInput
-	if err := decode(r, &in); err != nil {
-		fail(w, http.StatusBadRequest, err.Error())
-		return
-	}
-	run, code, err := s.startRun(r.Context(), in)
-	if err != nil {
-		fail(w, code, err.Error())
-		return
-	}
-	ok(w, run)
-}
-
-func (s *Server) startRun(ctx context.Context, in runInput) (store.Run, int, error) {
-	in.Branch = strings.TrimSpace(in.Branch)
-	if !validBranch(in.Branch) {
-		return store.Run{}, http.StatusBadRequest, errors.New("分支名不合法")
-	}
-	if !slices.Contains(harnesses, in.Harness) {
-		return store.Run{}, http.StatusBadRequest, errors.New("harness 只支持 claude / codex")
-	}
-	if in.TimeoutMinutes <= 0 {
-		in.TimeoutMinutes = 60
-	}
-	if in.TimeoutMinutes > 24*60 {
-		return store.Run{}, http.StatusBadRequest, errors.New("超时不能超过 24 小时")
-	}
-	repo, err := s.st.Repo(ctx, in.RepoID)
-	if err != nil {
-		return store.Run{}, http.StatusBadRequest, errors.New("仓库不存在")
-	}
-	rt, err := s.st.Runtime(ctx, in.RuntimeID)
-	if err != nil || strings.HasSuffix(rt.Name, "（已删除）") {
-		return store.Run{}, http.StatusBadRequest, errors.New("运行时不存在")
-	}
-	if rt.Info != nil {
-		for _, h := range rt.Info.Harnesses {
-			if h.Name == in.Harness && !h.Installed {
-				return store.Run{}, http.StatusBadRequest, fmt.Errorf("运行时 %s 上没有安装 %s", rt.Name, in.Harness)
-			}
-		}
-	}
-
-	var issue linear.Issue
-	switch {
-	case strings.TrimSpace(in.IssueKey) != "":
-		issue, err = linear.New(s.linearKey(ctx)).GetIssue(ctx, strings.TrimSpace(in.IssueKey))
-		if err != nil {
-			return store.Run{}, http.StatusBadGateway, err
-		}
-	case in.ManualIssue != nil && strings.TrimSpace(in.ManualIssue.Description) != "":
-		issue = linear.Issue{Identifier: "MANUAL", Title: strings.TrimSpace(in.ManualIssue.Title), Description: in.ManualIssue.Description}
-		if issue.Title == "" {
-			issue.Title = "（手动输入的需求）"
-		}
-	default:
-		return store.Run{}, http.StatusBadRequest, errors.New("请填写 Linear issue 编号，或手动输入需求")
-	}
-
-	run, err := s.st.CreateRun(ctx, store.NewRun{
-		RepoID: repo.ID, Branch: in.Branch, Issue: issue, RuntimeID: rt.ID, Harness: in.Harness,
-		TimeoutMinutes: in.TimeoutMinutes,
-		Prompt: func(id string) string {
-			return testplan.Prompt(testplan.Input{RunID: id, Issue: issue, RepoURL: repo.URL, Branch: in.Branch, TestNotes: repo.TestNotes})
-		},
-	})
-	if err != nil {
-		return store.Run{}, http.StatusInternalServerError, err
-	}
-	go s.hub.Schedule(rt.ID)
-	return run, 0, nil
-}
-
-func (s *Server) getRun(w http.ResponseWriter, r *http.Request) {
-	run, err := s.st.Run(r.Context(), r.PathValue("id"))
-	if err != nil {
-		failErr(w, err)
-		return
-	}
-	ok(w, run)
-}
-
-func (s *Server) runLogs(w http.ResponseWriter, r *http.Request) {
-	after, _ := strconv.ParseInt(r.URL.Query().Get("after"), 10, 64)
-	logs, err := s.st.Logs(r.Context(), r.PathValue("id"), after, 2000)
-	if err != nil {
-		failErr(w, err)
-		return
-	}
-	ok(w, logs)
-}
-
-func (s *Server) cancelRun(w http.ResponseWriter, r *http.Request) {
-	run, err := s.st.Run(r.Context(), r.PathValue("id"))
-	if err != nil {
-		failErr(w, err)
-		return
-	}
-	if err := s.hub.Cancel(r.Context(), run); err != nil {
-		fail(w, http.StatusConflict, err.Error())
-		return
-	}
-	ok(w, map[string]bool{"ok": true})
-}
-
-func (s *Server) rerun(w http.ResponseWriter, r *http.Request) {
-	old, err := s.st.Run(r.Context(), r.PathValue("id"))
-	if err != nil {
-		failErr(w, err)
-		return
-	}
-	in := runInput{RepoID: old.RepoID, Branch: old.Branch, RuntimeID: old.RuntimeID, Harness: old.Harness, TimeoutMinutes: old.TimeoutMinutes}
-	if old.Issue.ID != "" {
-		in.IssueKey = old.IssueKey // 重新拉取最新的 issue 内容
-	} else {
-		in.ManualIssue = &struct {
-			Title       string `json:"title"`
-			Description string `json:"description"`
-		}{old.Issue.Title, old.Issue.Description}
-	}
-	run, code, err := s.startRun(r.Context(), in)
-	if err != nil {
-		fail(w, code, err.Error())
-		return
-	}
-	ok(w, run)
-}
-
-func (s *Server) retryWriteBack(w http.ResponseWriter, r *http.Request) {
-	run, err := s.st.Run(r.Context(), r.PathValue("id"))
-	if err != nil {
-		failErr(w, err)
-		return
-	}
-	if !store.Terminal(run.Status) {
-		fail(w, http.StatusConflict, "测试尚未结束")
-		return
-	}
-	s.writeBack(run.ID)
-	run, _ = s.st.Run(r.Context(), run.ID)
-	ok(w, run)
-}
-
-// ---- Linear 回写 ----
-
-func (s *Server) writeBack(runID string) {
-	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
-	defer cancel()
-	run, err := s.st.Run(ctx, runID)
-	if err != nil || run.Issue.ID == "" || run.Status == store.StatusCanceled {
-		return
-	}
-	key := s.linearKey(ctx)
-	if key == "" {
-		_ = s.st.SetLinearResult(ctx, runID, "", "未配置 Linear API Key，未回写")
-		return
-	}
-	url, err := linear.New(key).CreateComment(ctx, run.Issue.ID, CommentBody(run, s.publicURL(ctx, nil)))
-	msg := ""
-	if err != nil {
-		msg = err.Error()
-		log.Printf("测试 %s 回写 Linear 失败: %v", runID, err)
-	}
-	_ = s.st.SetLinearResult(ctx, runID, url, msg)
-}
-
-var verdictText = map[string]string{
-	protocol.VerdictPass:    "✅ 通过",
-	protocol.VerdictFail:    "❌ 未通过",
-	protocol.VerdictPartial: "⚠️ 部分无法验证",
-}
-
-var acText = map[string]string{
-	protocol.ACPass:         "✅ 通过",
-	protocol.ACFail:         "❌ 未通过",
-	protocol.ACUnverifiable: "⚠️ 无法验证",
-}
-
-func mdCell(s string) string {
-	s = strings.ReplaceAll(s, "|", "\\|")
-	s = strings.ReplaceAll(s, "\r", "")
-	s = strings.ReplaceAll(s, "\n", "<br>")
-	if r := []rune(s); len(r) > 300 {
-		s = string(r[:300]) + "…"
-	}
-	return s
-}
-
-// CommentBody 生成回写到 Linear 的评论（Markdown）。
-func CommentBody(run store.Run, base string) string {
-	var b strings.Builder
-	b.WriteString("### Verdict 验收测试结果\n\n")
-	commit := run.CommitSHA
-	if len(commit) > 12 {
-		commit = commit[:12]
-	}
-	if run.Status == store.StatusCompleted {
-		fmt.Fprintf(&b, "**结论：%s**\n\n", verdictText[run.Verdict])
-	} else {
-		fmt.Fprintf(&b, "**测试未完成：%s**\n\n", mdCell(run.Error))
-	}
-	fmt.Fprintf(&b, "- 仓库：`%s` 分支 `%s`", run.RepoName, run.Branch)
-	if commit != "" {
-		fmt.Fprintf(&b, "（commit `%s`）", commit)
-	}
-	fmt.Fprintf(&b, "\n- 执行：%s @ %s\n", run.Harness, run.RuntimeName)
-	if run.SourceModified {
-		b.WriteString("- ⚠️ 测试过程中修改了被测源码，结论可信度降低\n")
-	}
-	if run.Summary != "" {
-		fmt.Fprintf(&b, "\n%s\n", run.Summary)
-	}
-	if len(run.ACs) > 0 {
-		b.WriteString("\n| # | 验收标准 | 结果 | 证据 |\n|---|---|---|---|\n")
-		for _, a := range run.ACs {
-			st := acText[a.Status]
-			if st == "" {
-				st = a.Status
-			}
-			fmt.Fprintf(&b, "| %s | %s | %s | %s |\n", mdCell(a.ID), mdCell(a.Criterion), st, mdCell(a.Evidence))
-		}
-	}
-	if base != "" {
-		fmt.Fprintf(&b, "\n[查看完整报告](%s/runs/%s)\n", base, run.ID)
-	}
-	return b.String()
 }
 
 // ---- 安装与下载 ----

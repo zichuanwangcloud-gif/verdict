@@ -50,7 +50,11 @@ func (Codex) Run(ctx context.Context, spec RunSpec) (Output, error) {
 	_ = os.Remove(lastFile)
 
 	args := []string{"exec", "--json", "--output-schema", schemaFile, "-o", lastFile,
-		"--dangerously-bypass-approvals-and-sandbox", "--skip-git-repo-check", "-C", spec.Dir, "-"}
+		"--dangerously-bypass-approvals-and-sandbox", "--skip-git-repo-check", "-C", spec.Dir}
+	if spec.MCP != nil {
+		args = append(args, codexMCPArgs(spec.MCP)...)
+	}
+	args = append(args, "-")
 
 	var failMsg string
 	err := runStreaming(ctx, spec, "codex", args, func(line []byte) {
@@ -73,6 +77,21 @@ func (Codex) Run(ctx context.Context, spec RunSpec) (Output, error) {
 		return Output{}, fmt.Errorf("Codex 最终输出不是 JSON: %s", clip(s, 300))
 	}
 	return Output{Structured: json.RawMessage(s)}, nil
+}
+
+// codexMCPArgs 用 -c 覆盖配置挂载 MCP（值是 TOML 字面量）。
+func codexMCPArgs(m *MCPServer) []string {
+	quote := func(s string) string { b, _ := json.Marshal(s); return string(b) } // JSON 字符串也是合法的 TOML 基本字符串
+	items := make([]string, len(m.Args))
+	for i, a := range m.Args {
+		items[i] = quote(a)
+	}
+	key := "mcp_servers." + m.Name
+	return []string{
+		"-c", key + ".command=" + quote(m.Command),
+		"-c", key + ".args=[" + strings.Join(items, ",") + "]",
+		"-c", key + ".startup_timeout_sec=120",
+	}
 }
 
 // codexLine 把一行 codex exec --json 事件翻译成日志；遇到失败事件时返回错误信息。
