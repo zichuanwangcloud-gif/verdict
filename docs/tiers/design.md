@@ -69,8 +69,8 @@ agent 负责启动和看管被测服务，不交给模型在后台随手起：
 
 ## UI 走查
 
-- 运行时上通过 `npx -y @playwright/mcp@0.0.84 --headless --isolated --output-dir <产物目录>` 提供浏览器工具。Claude Code 用 `--mcp-config … --strict-mcp-config`，Codex 用 `-c mcp_servers.playwright…`。
-- 探测项新增「浏览器」：检查 `npx` 是否可用、本机是否有 Playwright 浏览器缓存。
+- 运行时上通过 `npx -y @playwright/mcp@0.0.84 --headless --isolated --output-dir <产物目录> --executable-path <本机浏览器>` 提供浏览器工具。浏览器由 agent 查找（`VERDICT_BROWSER_PATH` → Playwright 缓存里最新的 chromium → 系统浏览器），避免 MCP 要求的浏览器版本与本机不一致时临时下载。Claude Code 用 `--mcp-config … --strict-mcp-config`，Codex 用 `-c mcp_servers.playwright…`。
+- 探测项新增「浏览器」：检查 `npx` 是否可用、能否找到浏览器可执行文件。
 - 截图保存到 `$VERDICT_ARTIFACTS`（工作区之外的产物目录）。阶段结束后 agent 把新产物通过 HTTP 上传到后端（用运行时令牌认证），报告页显示截图墙。
 - 单个文件 10MB 上限，每个测试最多 200 个产物。
 
@@ -104,3 +104,7 @@ agent 在 `hello` 里上报 `protocol: 2`。旧版 agent（没有这个字段）
 
 - 数据库启动时自动迁移，给已有的表补新列，用户现有的数据可以直接升级。
 - 旧版测试记录没有阶段数据，报告页按旧格式显示。
+
+## 升级
+
+后端升级后，旧版 agent（协议 v1）连接时会被识别为「版本过旧」，不再派发任务，页面上提示升级。运行时卡片上的「生成升级命令」会重新生成令牌（旧令牌立即失效）和安装命令；在运行时上执行后原地升级，仓库缓存和工作区目录保留。

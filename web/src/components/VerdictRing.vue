@@ -13,14 +13,14 @@ const segs = computed(() => {
   const gap = t > 1 ? 3 : 0
   let off = 0
   const out = []
-  for (const [k, color] of [['pass', 'var(--ok)'], ['fail', 'var(--bad)'], ['unverifiable', 'var(--warn)']]) {
-    const len = (c.value[k] / t) * C
+  for (const [k, color] of [['pass', 'var(--ok)'], ['fail', 'var(--bad)'], ['disputed', 'var(--dispute)'], ['unverifiable', 'var(--warn)']]) {
+    const len = ((c.value[k] || 0) / t) * C
     if (len > 0) out.push({ color, dash: `${Math.max(len - gap, 1)} ${C}`, offset: -off })
     off += len
   }
   return out
 })
-const live = computed(() => ['queued', 'dispatched', 'preparing', 'running'].includes(props.run.status))
+const live = computed(() => ['queued', 'dispatched', 'preparing', 'running', 'finalizing'].includes(props.run.status))
 </script>
 
 <template>

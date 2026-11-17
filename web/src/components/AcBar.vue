@@ -2,7 +2,7 @@
 import { computed } from 'vue'
 
 const props = defineProps({ acs: { type: Array, default: () => [] } })
-const tone = { pass: 'ok', fail: 'bad' }
+const tone = { pass: 'ok', fail: 'bad', disputed: 'dispute' }
 const segs = computed(() => props.acs.map((a) => tone[a.status] || 'warn'))
 </script>
 

@@ -1,6 +1,6 @@
 <script setup>
 import { ref, onMounted, onUnmounted } from 'vue'
-import { Plus, Server, RefreshCw, PencilLine, Trash2, Copy, Check, Terminal, ShieldAlert, X, Cpu, GitBranch, Container, Sparkles } from 'lucide-vue-next'
+import { Plus, Server, RefreshCw, PencilLine, Trash2, Copy, Check, Terminal, ShieldAlert, X, Cpu, GitBranch, Container, Sparkles, MonitorSmartphone, KeyRound, ArrowUpCircle } from 'lucide-vue-next'
 import { api } from '../api'
 import { ago } from '../format'
 import HarnessLogo from '../components/HarnessLogo.vue'
@@ -70,6 +70,21 @@ async function probe(rt) {
   }
 }
 
+async function rotate(rt, upgrade) {
+  const msg = upgrade
+    ? `为「${rt.name}」生成新的安装命令？在那台机器上执行后即完成升级；旧令牌立即失效。`
+    : `重新生成「${rt.name}」的令牌？旧令牌立即失效，agent 需要用新命令重新安装。`
+  if (!confirm(msg)) return
+  try {
+    created.value = await api.rotateToken(rt.id)
+    copied.value = false
+    window.scrollTo({ top: 0, behavior: 'smooth' })
+    load()
+  } catch (e) {
+    err.value = e.message
+  }
+}
+
 async function rename(rt) {
   const n = prompt('新名称', rt.name)
   if (!n || n.trim() === rt.name) return
@@ -117,7 +132,7 @@ function hState(h) {
 
     <section v-if="created" class="card glow stack" style="gap: 14px">
       <div class="card-head" style="margin: 0">
-        <div class="card-title"><Terminal :size="16" /> 在「{{ created.runtime.name }}」上执行</div>
+        <div class="card-title"><Terminal :size="16" /> 在「{{ created.runtime?.name }}」上执行</div>
         <button class="btn ghost icon" aria-label="关闭" @click="created = null"><X :size="16" /></button>
       </div>
       <div class="cmd">
@@ -132,6 +147,7 @@ function hState(h) {
             <li>用<b>普通用户</b>执行，不要用 root。agent 会以该用户身份运行 claude / codex，沿用其登录状态和 git 凭据。</li>
             <li>agent 以跳过权限确认的方式运行，建议使用专门的测试机或专用系统用户。</li>
             <li>私有仓库需要该用户能直接 <code>git clone</code>。</li>
+            <li>UI 走查需要 Node.js 和浏览器：<code>npx playwright install chromium</code>。</li>
           </ul>
         </div>
       </div>
@@ -160,7 +176,16 @@ function hState(h) {
               <RefreshCw :size="15" :class="{ spin: probing.has(rt.id) }" />
             </button>
             <button class="btn ghost icon" title="改名" @click="rename(rt)"><PencilLine :size="15" /></button>
+            <button class="btn ghost icon" title="重新生成令牌与安装命令" @click="rotate(rt, false)"><KeyRound :size="15" /></button>
             <button class="btn ghost icon danger" title="删除" @click="remove(rt)"><Trash2 :size="15" /></button>
+          </div>
+        </div>
+        <div v-if="rt.outdated" class="alert warn">
+          <ArrowUpCircle :size="16" />
+          <div class="stack body" style="flex: 1">
+            <b>agent 版本过旧（{{ rt.info?.agent_version }}），不会再接收测试</b>
+            <span>在那台机器上执行新的安装命令即可原地升级，已有缓存会保留。</span>
+            <div><button class="btn sm" @click="rotate(rt, true)"><ArrowUpCircle :size="13" /> 生成升级命令</button></div>
           </div>
         </div>
         <template v-if="rt.info">
@@ -181,6 +206,14 @@ function hState(h) {
                 <div class="detail" :title="h.detail">{{ h.detail }}</div>
               </div>
               <span class="pill" :class="hState(h).tone">{{ hState(h).text }}</span>
+            </div>
+            <div class="harness-row">
+              <span class="harness-logo" style="background: var(--grad)"><MonitorSmartphone :size="15" /></span>
+              <div style="min-width: 0; flex: 1">
+                <span class="name">无头浏览器</span>
+                <div class="detail" :title="rt.info.browser?.detail">{{ rt.info.browser?.detail || '未探测（agent 版本过旧）' }}</div>
+              </div>
+              <span class="pill" :class="rt.info.browser?.available ? 'ok' : ''">{{ rt.info.browser?.available ? '就绪' : '不可用' }}</span>
             </div>
           </div>
         </template>

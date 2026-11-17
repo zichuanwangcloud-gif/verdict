@@ -374,3 +374,16 @@ func (s *Store) DeleteRuntime(ctx context.Context, id int64) error {
 	}
 	return tx.Commit()
 }
+
+// RotateToken 为运行时生成新令牌，旧令牌立即失效。
+func (s *Store) RotateToken(ctx context.Context, id int64) (string, error) {
+	token := "vrt_" + RandomHex(24)
+	res, err := s.db.ExecContext(ctx, `UPDATE runtimes SET token_hash=? WHERE id=? AND token_hash NOT LIKE 'deleted:%'`, HashToken(token), id)
+	if err != nil {
+		return "", err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return "", ErrNotFound
+	}
+	return token, nil
+}

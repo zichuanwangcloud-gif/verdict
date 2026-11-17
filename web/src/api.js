@@ -53,6 +53,8 @@ export const api = {
   renameRuntime: (id, name) => call('PATCH', `/runtimes/${id}`, { name }),
   deleteRuntime: (id) => call('DELETE', `/runtimes/${id}`),
   probeRuntime: (id) => call('POST', `/runtimes/${id}/probe`),
+  rotateToken: (id) => call('POST', `/runtimes/${id}/token`),
+  tiers: () => call('GET', '/tiers'),
 
   repos: () => call('GET', '/repos'),
   createRepo: (r) => call('POST', '/repos', r),
@@ -66,6 +68,21 @@ export const api = {
   run: (id) => call('GET', `/runs/${id}`),
   logs: (id, after) => call('GET', `/runs/${id}/logs?after=${after}`),
   cancelRun: (id) => call('POST', `/runs/${id}/cancel`),
+  approveRun: (id, note) => call('POST', `/runs/${id}/approve`, { note }),
   rerun: (id) => call('POST', `/runs/${id}/rerun`),
   writeBack: (id) => call('POST', `/runs/${id}/linear`),
+}
+
+// 产物需要带管理员令牌下载：取成 blob URL 供 <img> 使用。
+const blobCache = new Map()
+export async function artifactURL(runId, name) {
+  const key = runId + '/' + name
+  if (blobCache.has(key)) return blobCache.get(key)
+  const res = await fetch(`/api/runs/${runId}/artifacts/${encodeURIComponent(name)}`, {
+    headers: auth.token ? { Authorization: 'Bearer ' + auth.token } : {},
+  })
+  if (!res.ok) throw new Error(`产物下载失败（HTTP ${res.status}）`)
+  const url = URL.createObjectURL(await res.blob())
+  blobCache.set(key, url)
+  return url
 }

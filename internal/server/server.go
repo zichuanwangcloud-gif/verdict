@@ -70,6 +70,7 @@ func (s *Server) Handler() http.Handler {
 	api.HandleFunc("PATCH /api/runtimes/{id}", s.renameRuntime)
 	api.HandleFunc("DELETE /api/runtimes/{id}", s.deleteRuntime)
 	api.HandleFunc("POST /api/runtimes/{id}/probe", s.probeRuntime)
+	api.HandleFunc("POST /api/runtimes/{id}/token", s.rotateToken)
 
 	api.HandleFunc("GET /api/repos", s.listRepos)
 	api.HandleFunc("POST /api/repos", s.createRepo)
@@ -310,6 +311,23 @@ func (s *Server) deleteRuntime(w http.ResponseWriter, r *http.Request) {
 	}
 	s.hub.Disconnect(id)
 	ok(w, map[string]bool{"ok": true})
+}
+
+// rotateToken 重新生成令牌与安装命令（用于升级 agent 或令牌泄露）。旧连接会被断开。
+func (s *Server) rotateToken(w http.ResponseWriter, r *http.Request) {
+	id, err := pathID(r)
+	if err != nil {
+		fail(w, http.StatusBadRequest, "id 无效")
+		return
+	}
+	token, err := s.st.RotateToken(r.Context(), id)
+	if err != nil {
+		failErr(w, err)
+		return
+	}
+	s.hub.Disconnect(id)
+	rt, _ := s.st.Runtime(r.Context(), id)
+	ok(w, map[string]any{"runtime": rt, "token": token, "install_command": s.installCommand(r.Context(), r, token)})
 }
 
 func (s *Server) probeRuntime(w http.ResponseWriter, r *http.Request) {
