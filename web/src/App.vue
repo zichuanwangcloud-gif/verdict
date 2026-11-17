@@ -1,7 +1,9 @@
 <script setup>
 import { computed } from 'vue'
+import { FlaskConical, Server, GitBranch, Settings as SettingsIcon, LogOut, Sun, Moon, ScanSearch } from 'lucide-vue-next'
 import { auth, setToken } from './api'
 import { route, go, match } from './router'
+import { theme, toggleTheme } from './theme'
 import Login from './pages/Login.vue'
 import Runs from './pages/Runs.vue'
 import NewRun from './pages/NewRun.vue'
@@ -11,10 +13,10 @@ import Repos from './pages/Repos.vue'
 import Settings from './pages/Settings.vue'
 
 const tabs = [
-  { path: '/runs', label: '测试' },
-  { path: '/runtimes', label: '运行时' },
-  { path: '/repos', label: '仓库' },
-  { path: '/settings', label: '设置' },
+  { path: '/runs', label: '验收测试', icon: FlaskConical },
+  { path: '/runtimes', label: '运行时', icon: Server },
+  { path: '/repos', label: '仓库', icon: GitBranch },
+  { path: '/settings', label: '设置', icon: SettingsIcon },
 ]
 
 const view = computed(() => {
@@ -32,24 +34,66 @@ const activeTab = computed(() => tabs.find((t) => route.path.startsWith(t.path))
 
 <template>
   <Login v-if="!auth.token" />
-  <template v-else>
-    <header>
-      <h1><a href="/runs" @click.prevent="go('/runs')">Verdict</a></h1>
+  <div v-else class="shell">
+    <aside class="sidebar">
+      <a href="/runs" class="brand" @click.prevent="go('/runs')">
+        <span class="brand-mark"><ScanSearch :size="18" /></span>
+        <span>
+          <div class="brand-name">Verdict</div>
+          <div class="brand-sub">AI 验收测试</div>
+        </span>
+      </a>
+      <button
+        v-for="t in tabs"
+        :key="t.path"
+        class="nav-item"
+        :class="{ active: activeTab === t.path }"
+        @click="go(t.path)"
+      >
+        <component :is="t.icon" :size="17" />
+        {{ t.label }}
+      </button>
+      <div class="sidebar-foot">
+        <button class="nav-item" @click="toggleTheme">
+          <component :is="theme === 'dark' ? Sun : Moon" :size="17" />
+          {{ theme === 'dark' ? '浅色模式' : '深色模式' }}
+        </button>
+        <button class="nav-item" @click="setToken('')">
+          <LogOut :size="17" />
+          退出登录
+        </button>
+      </div>
+    </aside>
+
+    <div class="topbar">
+      <div class="row between">
+        <a href="/runs" class="brand" @click.prevent="go('/runs')">
+          <span class="brand-mark"><ScanSearch :size="18" /></span>
+          <span class="brand-name">Verdict</span>
+        </a>
+        <div class="row">
+          <button class="btn ghost icon" :aria-label="theme === 'dark' ? '浅色模式' : '深色模式'" @click="toggleTheme">
+            <component :is="theme === 'dark' ? Sun : Moon" :size="17" />
+          </button>
+          <button class="btn ghost icon" aria-label="退出登录" @click="setToken('')"><LogOut :size="17" /></button>
+        </div>
+      </div>
       <nav>
         <button
           v-for="t in tabs"
           :key="t.path"
+          class="nav-item"
           :class="{ active: activeTab === t.path }"
           @click="go(t.path)"
         >
+          <component :is="t.icon" :size="15" />
           {{ t.label }}
         </button>
       </nav>
-      <span class="spacer" />
-      <button class="link" @click="setToken('')">退出</button>
-    </header>
-    <main>
+    </div>
+
+    <main class="content">
       <component :is="view.comp" v-bind="view.props" :key="route.path" />
     </main>
-  </template>
+  </div>
 </template>

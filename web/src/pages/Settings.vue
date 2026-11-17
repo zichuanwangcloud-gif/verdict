@@ -1,5 +1,6 @@
 <script setup>
 import { ref, onMounted } from 'vue'
+import { KeyRound, Globe, Sparkles, Check, Trash2 } from 'lucide-vue-next'
 import { api } from '../api'
 
 const s = ref(null)
@@ -25,6 +26,7 @@ async function save(body) {
     s.value = await api.saveSettings(body)
     key.value = ''
     msg.value = '已保存'
+    setTimeout(() => (msg.value = ''), 2500)
   } catch (e) {
     err.value = e.message
   }
@@ -32,31 +34,38 @@ async function save(body) {
 </script>
 
 <template>
-  <h2>设置</h2>
-  <div v-if="err" class="error">{{ err }}</div>
-  <div v-if="msg" class="ok-box">{{ msg }}</div>
-  <template v-if="s">
-    <form class="card form" @submit.prevent="save({ linear_api_key: key })">
-      <h3>Linear API Key</h3>
-      <p class="muted">
-        用于读取 issue 和回写评论。在 Linear 的 Settings → Security &amp; access → Personal API keys 创建。
-        当前：{{ s.linear_api_key_masked || '未配置' }}
-      </p>
-      <div class="row">
-        <input v-model="key" type="password" placeholder="lin_api_…" />
-        <button class="primary" :disabled="!key.trim()">保存</button>
-        <button v-if="s.linear_api_key_masked" type="button" class="danger" @click="save({ linear_api_key: '' })">清除</button>
+  <div class="page">
+    <div class="page-head">
+      <div>
+        <div class="eyebrow"><Sparkles :size="12" /> Settings</div>
+        <h2>设置</h2>
       </div>
-    </form>
-    <form class="card form" @submit.prevent="save({ public_url: publicURL })">
-      <h3>对外地址</h3>
-      <p class="muted">
-        运行时连接后端、Linear 评论里的报告链接都用这个地址。留空时根据当前访问地址推断（现在是 <code>{{ s.public_url_effective }}</code>）。
-      </p>
-      <div class="row">
-        <input v-model="publicURL" placeholder="https://verdict.example.com" />
-        <button class="primary">保存</button>
-      </div>
-    </form>
-  </template>
+    </div>
+    <div v-if="err" class="alert bad">{{ err }}</div>
+    <div v-if="msg" class="alert ok"><Check :size="16" /> {{ msg }}</div>
+
+    <template v-if="s">
+      <form class="card stack" style="gap: 14px" @submit.prevent="save({ linear_api_key: key })">
+        <div class="card-head" style="margin: 0">
+          <div class="card-title"><KeyRound :size="16" /> Linear API Key</div>
+          <span class="pill" :class="s.linear_api_key_masked ? 'ok' : ''">{{ s.linear_api_key_masked || '未配置' }}</span>
+        </div>
+        <p class="text-2">用于读取 issue 和回写评论。在 Linear 的 Settings → Security &amp; access → Personal API keys 创建。</p>
+        <div class="input-group">
+          <input v-model="key" type="password" placeholder="lin_api_…" />
+          <button class="btn primary" :disabled="!key.trim()">保存</button>
+          <button v-if="s.linear_api_key_masked" type="button" class="btn danger" @click="save({ linear_api_key: '' })"><Trash2 :size="14" /></button>
+        </div>
+      </form>
+
+      <form class="card stack" style="gap: 14px" @submit.prevent="save({ public_url: publicURL })">
+        <div class="card-title"><Globe :size="16" /> 对外地址</div>
+        <p class="text-2">运行时连接本站、Linear 评论里的报告链接都用这个地址。留空时按当前访问地址推断（现在是 <code>{{ s.public_url_effective }}</code>）。</p>
+        <div class="input-group">
+          <input v-model="publicURL" class="mono" placeholder="https://verdict.example.com" />
+          <button class="btn primary">保存</button>
+        </div>
+      </form>
+    </template>
+  </div>
 </template>
