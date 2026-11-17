@@ -282,18 +282,26 @@ func Next(cfg Config, in Input, recs []StageRecord) Step {
 	}
 
 	// 5. 红蓝循环
+	redHarness := cfg.RedHarness
 	for round := 1; round <= cfg.RedRounds; round++ {
 		red := latest(recs, RoleRed, round)
 		if red == nil {
 			if r := lacks(cfg, recs, RoleRed); r != "" {
 				return skip(RoleRed, round, r)
 			}
-			return harnessStage(RoleRed, round, cfg.RedHarness, false)
+			st := harnessStage(RoleRed, round, redHarness, false)
+			if redHarness != cfg.RedHarness {
+				st.Note = fmt.Sprintf("交叉模型 %s 在之前的轮次失败过，本轮直接使用 %s", cfg.RedHarness, cfg.Harness)
+			}
+			return st
 		}
 		if (red.Status == StatusError || red.Status == StatusTimeout) && red.Harness != cfg.Harness && attempts(recs, RoleRed, round) == 1 {
 			st := harnessStage(RoleRed, round, cfg.Harness, false)
 			st.Note = fmt.Sprintf("交叉模型 %s 执行失败，改用 %s 新开会话重试：%s", red.Harness, cfg.Harness, clip(red.Error, 200))
 			return st
+		}
+		if attempts(recs, RoleRed, round) > 1 {
+			redHarness = cfg.Harness // 本轮交叉模型失败过，后续轮次不再尝试
 		}
 		if red.Status != StatusOK || len(redChallenges(red)) == 0 {
 			break // 失败、跳过，或红队没有质疑（收敛）

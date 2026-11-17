@@ -180,6 +180,11 @@ func Consolidate(cfg Config, recs []StageRecord) Result {
 			if out.Summary != "" {
 				res.Summary = out.Summary
 			}
+			// 裁决合并去重后的额外发现替换各阶段的原始列表；裁决没有给出时保留原始列表。
+			if len(out.Findings) > 0 {
+				res.Findings = nil
+				addFindings(out.Findings, RoleJudge)
+			}
 			judged = true
 		}
 	}

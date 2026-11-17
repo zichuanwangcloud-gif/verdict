@@ -109,6 +109,7 @@ var (
 			"confidence": enum("high", "medium", "low"),
 			"rationale":  str,
 		})),
+		"findings": arr(finding),
 	}))
 )
 
@@ -190,8 +191,9 @@ type exploreOut struct {
 }
 
 type judgeOut struct {
-	Summary string `json:"summary"`
-	ACs     []struct {
+	Summary  string       `json:"summary"`
+	Findings []findingOut `json:"findings"`
+	ACs      []struct {
 		ID         string `json:"id"`
 		Status     string `json:"status"`
 		Confidence string `json:"confidence"`

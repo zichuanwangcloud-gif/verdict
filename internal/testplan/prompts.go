@@ -270,6 +270,7 @@ func writeRedTask(b *strings.Builder, plan *Plan, cur Result) {
 	}
 	b.WriteString("\n蓝队当前的结论与证据（含此前各轮的质疑和回应）：\n\n")
 	b.WriteString(renderACs(cur.ACs, true))
+	b.WriteString(renderKnownFindings(cur.Findings))
 }
 
 func writeRecheckTask(b *strings.Builder, cfg Config, round int, cur Result) {
@@ -303,6 +304,7 @@ severity 取值：critical（数据丢失、安全漏洞、核心功能不可用
 `)
 	b.WriteString("\n验收标准当前的结论（供参考，避免重复）：\n\n")
 	b.WriteString(renderACs(cur.ACs, false))
+	b.WriteString(renderKnownFindings(cur.Findings))
 }
 
 func writeJudgeTask(b *strings.Builder, plan *Plan, cur Result, recs []StageRecord) {
@@ -314,6 +316,9 @@ func writeJudgeTask(b *strings.Builder, plan *Plan, cur Result, recs []StageReco
 confidence：high（证据充分、多次一致）、medium（证据可信但不够全面）、low（证据薄弱或只读了代码）。
 rationale 简述理由并引用关键证据。summary 用中文总结整体结论、主要问题和仍存在的分歧。
 acs 必须覆盖下面列出的每一条，编号保持不变。
+
+此外整理各阶段报告的「额外发现」写进 findings：同一个根因的合并为一条（取这些条目里**最高**的 severity，合并证据，不允许降低），
+没有证据支撑的纯推测删去，已经体现在验收结论里的不再重复。没有额外发现时 findings 为空数组。
 `)
 	if plan != nil {
 		b.WriteString("\n测试计划：\n\n")
@@ -321,6 +326,12 @@ acs 必须覆盖下面列出的每一条，编号保持不变。
 	}
 	b.WriteString("\n当前结论、证据、质疑与回应：\n\n")
 	b.WriteString(renderACs(cur.ACs, true))
+	if len(cur.Findings) > 0 {
+		b.WriteString("\n各阶段报告的额外发现（待合并去重）：\n\n")
+		for i, f := range cur.Findings {
+			fmt.Fprintf(b, "%d. [%s] %s（来自%s）\n   %s\n   证据：%s\n", i+1, f.Severity, f.Title, RoleName(f.Source), clip(f.Detail, 600), clip(f.Evidence, 800))
+		}
+	}
 	for _, r := range recs {
 		if r.Status == StatusSkipped || r.Note != "" {
 			fmt.Fprintf(b, "\n说明：%s 阶段（第 %d 轮）%s %s", roleName[r.Role], r.Round, statusName(r.Status), r.Note)
@@ -393,6 +404,18 @@ func renderACs(acs []protocol.ACResult, withChallenges bool) string {
 			}
 		}
 		b.WriteString("\n")
+	}
+	return b.String()
+}
+
+func renderKnownFindings(fs []protocol.Finding) string {
+	if len(fs) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString("\n已经记录的额外发现（不要重复报告，除非有新的证据或更严重的影响）：\n")
+	for _, f := range fs {
+		fmt.Fprintf(&b, "- [%s] %s\n", f.Severity, f.Title)
 	}
 	return b.String()
 }

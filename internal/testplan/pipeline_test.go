@@ -272,3 +272,50 @@ func TestPresetsRoundTrip(t *testing.T) {
 		t.Errorf("Normalize 不对: %+v", n)
 	}
 }
+
+func TestCrossModelStickyFallback(t *testing.T) {
+	cfg := withHarness(Preset(TierS))
+	out := happy(2)
+	roles, recs, _ := sim(t, cfg, in, func(s StageSpec) (string, json.RawMessage, int64) {
+		if s.Role == RoleRed && s.Harness == "codex" {
+			return StatusError, nil, 1000
+		}
+		return out(s)
+	})
+	got := strings.Join(roles, " ")
+	if got != "plan service verify ui red1@codex red1 recheck1 red2 recheck2 red3 explore judge" {
+		t.Fatalf("交叉模型失败后，后续轮次应直接用主 harness: %s", got)
+	}
+	_ = recs
+}
+
+func TestFindingsDedupe(t *testing.T) {
+	cfg := withHarness(Preset(TierS))
+	ui := j(map[string]any{"acs": []any{}, "findings": []map[string]string{{"severity": "high", "title": "XSS", "detail": "d", "evidence": "e"}}})
+	recs := []StageRecord{
+		{Role: RolePlan, Status: StatusOK, Output: planOut},
+		{Role: RoleService, Status: StatusOK, Service: &protocol.ServiceStatus{Running: true}},
+		{Role: RoleVerify, Status: StatusOK, Output: report("pass", "pass")},
+		{Role: RoleUI, Status: StatusOK, Output: ui},
+	}
+	if st := Next(cfg, in, recs); st.Stage.Role != RoleRed || !strings.Contains(st.Stage.Prompt, "不要重复报告") || !strings.Contains(st.Stage.Prompt, "[high] XSS") {
+		t.Fatal("红队提示词应列出已记录的发现")
+	}
+	recs = append(recs,
+		StageRecord{Role: RoleRed, Round: 1, Status: StatusOK, Output: j(map[string]any{"challenges": []any{}, "findings": []map[string]string{{"severity": "medium", "title": "XSS again", "detail": "d", "evidence": "e"}}})},
+		StageRecord{Role: RoleExplore, Status: StatusOK, Output: j(map[string]any{"findings": []map[string]string{{"severity": "critical", "title": "存储型 XSS", "detail": "d", "evidence": "e"}}})},
+	)
+	if got := len(Consolidate(cfg, recs).Findings); got != 3 {
+		t.Fatalf("裁决前应保留原始发现: %d", got)
+	}
+	st := Next(cfg, in, recs)
+	if st.Stage.Role != RoleJudge || !strings.Contains(st.Stage.Prompt, "待合并去重") {
+		t.Fatal("裁决提示词应包含待合并的发现")
+	}
+	recs = append(recs, StageRecord{Role: RoleJudge, Status: StatusOK, Output: j(map[string]any{"summary": "s", "acs": []any{},
+		"findings": []map[string]string{{"severity": "critical", "title": "存储型 XSS（合并）", "detail": "d", "evidence": "e"}}})})
+	res := Consolidate(cfg, recs)
+	if len(res.Findings) != 1 || res.Findings[0].Source != RoleJudge || res.Findings[0].Severity != "critical" {
+		t.Fatalf("裁决合并后的发现应替换原始列表: %+v", res.Findings)
+	}
+}
