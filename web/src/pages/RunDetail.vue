@@ -1,28 +1,34 @@
 <script setup>
-import { ref, computed, onMounted, onUnmounted, nextTick } from 'vue'
+import { ref, computed, onMounted, onUnmounted } from 'vue'
+import {
+  ArrowLeft, RotateCcw, Square, GitBranch, GitCommitHorizontal, Server, Clock, Coins, ExternalLink,
+  Sparkles, CircleCheck, CircleX, CircleHelp, ChevronRight, TriangleAlert, FileDiff, ScrollText,
+  MessageSquare, Send, Braces, Radio,
+} from 'lucide-vue-next'
 import { api } from '../api'
 import { go } from '../router'
-import { runTone, runLabel, acText, acTone, fmtTime, fmtDuration } from '../format'
+import { acText, fmtTime, fmtDuration, harnessName, isLive } from '../format'
+import StatusPill from '../components/StatusPill.vue'
+import VerdictRing from '../components/VerdictRing.vue'
+import LogStream from '../components/LogStream.vue'
 
 const props = defineProps({ id: String })
 const run = ref(null)
 const logs = ref([])
 const err = ref('')
 const actionErr = ref('')
-const follow = ref(true)
-const logBox = ref(null)
+const closed = ref(new Set())
 let lastSeq = 0
 let timer
 let loading = false
 
-const terminal = computed(() => run.value && ['completed', 'error', 'canceled'].includes(run.value.status))
+const live = computed(() => isLive(run.value))
 
 async function load() {
   if (loading) return
   loading = true
   try {
     run.value = await api.run(props.id)
-    // 一次最多 2000 行，循环取完
     for (;;) {
       const batch = await api.logs(props.id, lastSeq)
       if (!batch.length) break
@@ -31,11 +37,7 @@ async function load() {
       if (batch.length < 2000) break
     }
     err.value = ''
-    if (follow.value) {
-      await nextTick()
-      if (logBox.value) logBox.value.scrollTop = logBox.value.scrollHeight
-    }
-    if (terminal.value) clearInterval(timer)
+    if (!live.value) clearInterval(timer)
   } catch (e) {
     err.value = e.message
   } finally {
@@ -57,132 +59,157 @@ async function act(fn) {
     actionErr.value = e.message
   }
 }
-
 async function cancel() {
   if (!confirm('确定取消这次测试？')) return
   await act(() => api.cancelRun(props.id))
   load()
 }
-
 async function rerun() {
   const r = await act(() => api.rerun(props.id))
   if (r) go('/runs/' + r.id)
 }
-
 async function writeBack() {
   const r = await act(() => api.writeBack(props.id))
   if (r) run.value = r
 }
 
-function onScroll() {
-  const el = logBox.value
-  if (el) follow.value = el.scrollHeight - el.scrollTop - el.clientHeight < 40
+function toggle(id) {
+  const s = new Set(closed.value)
+  s.has(id) ? s.delete(id) : s.add(id)
+  closed.value = s
 }
 
-function fmtLogTime(ts) {
-  return new Date(ts).toLocaleTimeString('zh-CN', { hour12: false })
-}
+const acIcon = { pass: CircleCheck, fail: CircleX, unverifiable: CircleHelp }
+const acTone = { pass: 'ok', fail: 'bad', unverifiable: 'warn' }
+
+// 执行阶段进度
+const steps = computed(() => {
+  const s = run.value?.status
+  const order = ['queued', 'preparing', 'running', 'done']
+  const idx = { queued: 0, dispatched: 0, preparing: 1, running: 2, completed: 3, error: 3, canceled: 3 }[s] ?? 0
+  const labels = ['排队', '准备工作区', 'Agent 测试', s === 'completed' ? '得出结论' : s === 'canceled' ? '已取消' : s === 'error' ? '出错' : '得出结论']
+  return order.map((_, i) => ({
+    label: labels[i],
+    state: i < idx ? 'done' : i === idx ? (i === 3 ? (s === 'completed' ? 'done' : 'fail') : 'now') : '',
+  }))
+})
 </script>
 
 <template>
-  <div v-if="err && !run" class="error">{{ err }}</div>
-  <template v-if="run">
-    <div class="row between">
-      <div>
-        <a href="/runs" @click.prevent="go('/runs')">← 测试列表</a>
-        <h2 class="title">
-          <span class="tag big" :class="runTone(run)">{{ runLabel(run) }}</span>
-          <span class="mono">{{ run.issue_key }}</span> {{ run.issue.title }}
-        </h2>
+  <div class="page">
+    <a href="/runs" class="row muted" style="gap: 4px" @click.prevent="go('/runs')"><ArrowLeft :size="14" /> 验收测试</a>
+    <div v-if="err && !run" class="alert bad">{{ err }}</div>
+
+    <template v-if="run">
+      <!-- 头部 -->
+      <section class="card glow" :class="{ shimmer: live }">
+        <div class="hero">
+          <VerdictRing :run="run" />
+          <div style="min-width: 0">
+            <div class="row between">
+              <StatusPill :run="run" large />
+              <div class="row">
+                <button v-if="live" class="btn sm danger" @click="cancel"><Square :size="13" /> 取消</button>
+                <button class="btn sm" @click="rerun"><RotateCcw :size="13" /> 重新测试</button>
+              </div>
+            </div>
+            <div class="hero-title"><span class="issue-key">{{ run.issue_key }}</span>{{ run.issue.title }}</div>
+            <div class="meta-chips">
+              <span class="chip"><GitBranch /> {{ run.repo_name }} · <span class="mono">{{ run.branch }}</span></span>
+              <span v-if="run.commit_sha" class="chip mono" :title="run.commit_sha"><GitCommitHorizontal /> {{ run.commit_sha.slice(0, 10) }}</span>
+              <span class="chip"><Server /> {{ harnessName(run.harness) }} @ {{ run.runtime_name }}</span>
+              <span class="chip" :title="'创建于 ' + fmtTime(run.created_at)"><Clock /> {{ fmtDuration(run.started_at, run.finished_at) }}</span>
+              <span v-if="run.cost_usd" class="chip"><Coins /> ${{ run.cost_usd.toFixed(4) }}</span>
+              <a v-if="run.issue.url" class="chip" :href="run.issue.url" target="_blank" rel="noopener"><ExternalLink /> Linear</a>
+            </div>
+          </div>
+        </div>
+        <div class="steps" style="margin-top: 18px">
+          <template v-for="(s, i) in steps" :key="i">
+            <span v-if="i" class="step-line" />
+            <span class="step" :class="s.state"><span class="dot" /> {{ s.label }}</span>
+          </template>
+        </div>
+      </section>
+
+      <div v-if="actionErr" class="alert bad">{{ actionErr }}</div>
+      <div v-if="run.error" class="alert bad"><TriangleAlert :size="16" /><span class="body">{{ run.error }}</span></div>
+      <div v-if="run.source_modified" class="alert warn">
+        <FileDiff :size="16" />
+        <div class="stack" style="min-width: 0; flex: 1">
+          <b>测试过程中被测源码发生了改动，结论可信度降低</b>
+          <details>
+            <summary><ChevronRight :size="14" class="chev" /> 查看 diff</summary>
+            <pre>{{ run.diff }}</pre>
+          </details>
+        </div>
       </div>
-      <div class="row">
-        <button v-if="!terminal" @click="cancel">取消测试</button>
-        <button @click="rerun">重新测试</button>
-      </div>
-    </div>
-    <div v-if="actionErr" class="error">{{ actionErr }}</div>
 
-    <div class="card">
-      <dl class="meta">
-        <dt>需求</dt>
-        <dd>
-          <a v-if="run.issue.url" :href="run.issue.url" target="_blank" rel="noopener">{{ run.issue.identifier }}</a>
-          <span v-else>手动输入</span>
-        </dd>
-        <dt>仓库</dt>
-        <dd>{{ run.repo_name }} <span class="muted mono">{{ run.repo_url }}</span></dd>
-        <dt>分支</dt>
-        <dd class="mono">{{ run.branch }} <span v-if="run.commit_sha" class="muted">@ {{ run.commit_sha }}</span></dd>
-        <dt>执行</dt>
-        <dd>{{ run.harness }} @ {{ run.runtime_name }}</dd>
-        <dt>时间</dt>
-        <dd>
-          {{ fmtTime(run.created_at) }} 创建，耗时 {{ fmtDuration(run.started_at, run.finished_at) }}
-          <span v-if="run.cost_usd" class="muted">，模型费用 ${{ run.cost_usd.toFixed(4) }}</span>
-        </dd>
-        <template v-if="run.issue.url">
-          <dt>Linear 回写</dt>
-          <dd>
-            <a v-if="run.linear_comment_url" :href="run.linear_comment_url" target="_blank" rel="noopener">已回写评论</a>
-            <span v-else-if="run.linear_error" class="bad-text">{{ run.linear_error }}</span>
-            <span v-else class="muted">{{ terminal ? '回写中…' : '测试结束后自动回写' }}</span>
-            <button v-if="terminal && run.status !== 'canceled'" class="small" @click="writeBack">重新回写</button>
-          </dd>
-        </template>
-      </dl>
-    </div>
+      <!-- 结论 -->
+      <section v-if="run.status === 'completed'" class="card stack" style="gap: 16px">
+        <div class="card-title"><Sparkles :size="16" /> AI 结论</div>
+        <div v-if="run.summary" class="summary"><Sparkles :size="16" /><p class="body">{{ run.summary }}</p></div>
+        <div class="ac-list">
+          <div v-for="a in run.acs" :key="a.id" class="ac">
+            <div class="ac-head" @click="toggle(a.id)">
+              <span class="ac-icon" :class="acTone[a.status] || 'warn'"><component :is="acIcon[a.status] || CircleHelp" :size="15" /></span>
+              <div style="flex: 1; min-width: 0">
+                <div class="row" style="gap: 8px">
+                  <span class="ac-id">{{ a.id }}</span>
+                  <span class="pill" :class="acTone[a.status] || 'warn'">{{ acText[a.status] || a.status }}</span>
+                </div>
+                <div style="margin-top: 4px">{{ a.criterion }}</div>
+              </div>
+              <ChevronRight :size="16" class="muted" :style="{ transform: closed.has(a.id) ? '' : 'rotate(90deg)', transition: 'transform .15s' }" />
+            </div>
+            <div v-if="!closed.has(a.id)" class="ac-body">
+              <div v-if="a.evidence">
+                <span class="label">证据</span>
+                <pre>{{ a.evidence }}</pre>
+              </div>
+              <div v-if="a.reasoning">
+                <span class="label">判断依据</span>
+                <p class="body text-2">{{ a.reasoning }}</p>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
 
-    <div v-if="run.error" class="error">{{ run.error }}</div>
-
-    <div v-if="run.source_modified" class="warn-box">
-      ⚠ 测试过程中被测源码发生了改动，结论可信度降低。
-      <details>
-        <summary>查看 diff</summary>
-        <pre>{{ run.diff }}</pre>
-      </details>
-    </div>
-
-    <div v-if="run.status === 'completed'" class="card">
-      <h3>总结</h3>
-      <p class="body">{{ run.summary }}</p>
-      <h3>验收标准（{{ run.acs.length }} 条）</h3>
-      <div v-for="a in run.acs" :key="a.id" class="ac">
+      <!-- Linear 回写 -->
+      <section v-if="run.issue.url" class="card row between">
         <div class="row">
-          <span class="tag" :class="acTone[a.status]">{{ acText[a.status] || a.status }}</span>
-          <b class="mono">{{ a.id }}</b>
-          <span>{{ a.criterion }}</span>
+          <span class="choice-icon"><MessageSquare :size="16" /></span>
+          <div>
+            <div class="choice-title">回写到 Linear</div>
+            <div class="choice-sub">
+              <a v-if="run.linear_comment_url" :href="run.linear_comment_url" target="_blank" rel="noopener">已发布评论 ↗</a>
+              <span v-else-if="run.linear_error" style="color: var(--bad)">{{ run.linear_error }}</span>
+              <span v-else>{{ live ? '测试结束后自动回写' : '回写中…' }}</span>
+            </div>
+          </div>
         </div>
-        <div v-if="a.evidence">
-          <div class="muted">证据</div>
-          <pre>{{ a.evidence }}</pre>
-        </div>
-        <div v-if="a.reasoning">
-          <div class="muted">判断依据</div>
-          <p class="body">{{ a.reasoning }}</p>
-        </div>
-      </div>
-    </div>
+        <button v-if="!live && run.status !== 'canceled'" class="btn sm" @click="writeBack"><Send :size="13" /> 重新回写</button>
+      </section>
 
-    <div class="card">
-      <div class="row between">
-        <h3>执行日志</h3>
-        <label class="inline muted"><input v-model="follow" type="checkbox" /> 自动滚动</label>
-      </div>
-      <div ref="logBox" class="logs" @scroll="onScroll">
-        <div v-if="!logs.length" class="muted">{{ terminal ? '没有日志' : '等待运行时开始执行…' }}</div>
-        <div v-for="l in logs" :key="l.seq" class="log-line">
-          <span class="muted">{{ fmtLogTime(l.ts) }}</span> {{ l.text }}
+      <!-- 思考流 -->
+      <section class="card stack" style="gap: 12px">
+        <div class="card-head" style="margin: 0">
+          <div class="card-title"><ScrollText :size="16" /> Agent 执行流</div>
+          <span v-if="live" class="pill live"><Radio :size="13" /> 实时</span>
+          <span v-else class="muted" style="font-size: 12px">{{ logs.length }} 条</span>
         </div>
-      </div>
-    </div>
+        <LogStream :logs="logs" :live="live" />
+      </section>
 
-    <details class="card">
-      <summary>交给模型的提示词</summary>
-      <pre>{{ run.prompt }}</pre>
-    </details>
-    <details v-if="run.raw" class="card">
-      <summary>模型原始结构化输出</summary>
-      <pre>{{ run.raw }}</pre>
-    </details>
-  </template>
+      <details class="card">
+        <summary><ChevronRight :size="14" class="chev" /><Braces :size="14" /> 交给 agent 的提示词</summary>
+        <pre>{{ run.prompt }}</pre>
+      </details>
+      <details v-if="run.raw" class="card">
+        <summary><ChevronRight :size="14" class="chev" /><Braces :size="14" /> 原始结构化输出</summary>
+        <pre>{{ run.raw }}</pre>
+      </details>
+    </template>
+  </div>
 </template>

@@ -1,5 +1,6 @@
 <script setup>
 import { ref } from 'vue'
+import { ScanSearch, ArrowRight, KeyRound } from 'lucide-vue-next'
 import { api, setToken } from '../api'
 
 const token = ref('')
@@ -22,15 +23,22 @@ async function submit() {
 </script>
 
 <template>
-  <main class="narrow">
-    <div class="card">
-      <h2>登录 Verdict</h2>
-      <p class="muted">输入后端的管理员令牌（环境变量 <code>VERDICT_ADMIN_TOKEN</code>；未设置时见后端启动日志）。</p>
-      <form class="row" @submit.prevent="submit">
-        <input v-model="token" type="password" placeholder="管理员令牌" autofocus />
-        <button class="primary" :disabled="!token || busy">登录</button>
-      </form>
-      <div v-if="err" class="error">{{ err }}</div>
-    </div>
-  </main>
+  <div class="login">
+    <form class="card glow login-card" @submit.prevent="submit">
+      <span class="login-mark"><ScanSearch :size="26" /></span>
+      <div>
+        <h2>欢迎使用 <span class="grad-text">Verdict</span></h2>
+        <p class="text-2" style="margin-top: 6px">让 AI agent 按验收标准，替你把每个分支真正跑一遍。</p>
+      </div>
+      <div class="field">
+        <label for="tok"><KeyRound :size="12" /> 管理员令牌</label>
+        <input id="tok" v-model="token" type="password" placeholder="VERDICT_ADMIN_TOKEN" autofocus />
+        <span class="hint">未设置环境变量时，令牌打印在后端启动日志里。</span>
+      </div>
+      <div v-if="err" class="alert bad">{{ err }}</div>
+      <button class="btn primary" :disabled="!token || busy">
+        {{ busy ? '验证中…' : '进入控制台' }} <ArrowRight :size="16" />
+      </button>
+    </form>
+  </div>
 </template>

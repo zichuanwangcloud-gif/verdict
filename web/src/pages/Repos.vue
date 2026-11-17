@@ -1,9 +1,11 @@
 <script setup>
 import { ref, onMounted } from 'vue'
+import { Plus, GitBranch, PencilLine, Trash2, NotebookPen, KeyRound, Sparkles, X } from 'lucide-vue-next'
 import { api } from '../api'
 
 const list = ref([])
 const err = ref('')
+const adding = ref(false)
 const form = ref({ url: '', name: '', test_notes: '' })
 const editing = ref(null)
 
@@ -21,14 +23,11 @@ async function add() {
   try {
     await api.createRepo(form.value)
     form.value = { url: '', name: '', test_notes: '' }
+    adding.value = false
     load()
   } catch (e) {
     err.value = e.message
   }
-}
-
-function edit(r) {
-  editing.value = { ...r }
 }
 
 async function save() {
@@ -63,52 +62,86 @@ function repoKey(url) {
   u = u.replace(/[^A-Za-z0-9._-]+/g, '_').replace(/^[._-]+|[._-]+$/g, '')
   return u || 'repo'
 }
+
+const notesPlaceholder = '交给 agent 的测试说明：\n- 怎么安装依赖、怎么启动服务\n- 依赖哪些外部服务（数据库、缓存…）\n- 测试账号、端口、注意事项'
 </script>
 
 <template>
-  <h2>仓库</h2>
-  <div v-if="err" class="error">{{ err }}</div>
+  <div class="page">
+    <div class="page-head">
+      <div>
+        <div class="eyebrow"><Sparkles :size="12" /> Repositories</div>
+        <h2>仓库</h2>
+        <p class="sub">被测仓库与它的「测试说明」。说明写得越具体，agent 越容易把服务跑起来，结论也越可靠。</p>
+      </div>
+      <button v-if="!adding" class="btn primary" @click="adding = true"><Plus :size="16" /> 添加仓库</button>
+    </div>
+    <div v-if="err" class="alert bad">{{ err }}</div>
 
-  <form class="card form" @submit.prevent="add">
-    <h3>添加仓库</h3>
-    <input v-model="form.url" placeholder="git 地址，如 git@github.com:org/repo.git 或 https://github.com/org/repo.git" />
-    <input v-model="form.name" placeholder="显示名称（可选，默认取 org/repo）" />
-    <textarea
-      v-model="form.test_notes"
-      rows="5"
-      placeholder="测试说明（可选，会交给模型）：怎么安装依赖、怎么启动服务、依赖哪些外部服务、测试账号、注意事项…"
-    />
-    <div><button class="primary" :disabled="!form.url.trim()">添加</button></div>
-  </form>
-
-  <div v-for="r in list" :key="r.id" class="card">
-    <template v-if="editing && editing.id === r.id">
-      <div class="form">
-        <input v-model="editing.url" />
-        <input v-model="editing.name" />
-        <textarea v-model="editing.test_notes" rows="8" placeholder="测试说明" />
-        <div class="row">
-          <button class="primary" @click="save">保存</button>
-          <button @click="editing = null">取消</button>
+    <form v-if="adding" class="card glow stack" style="gap: 14px" @submit.prevent="add">
+      <div class="card-head" style="margin: 0">
+        <div class="card-title"><GitBranch :size="16" /> 添加仓库</div>
+        <button type="button" class="btn ghost icon" aria-label="关闭" @click="adding = false"><X :size="16" /></button>
+      </div>
+      <div class="grid-2">
+        <div class="field">
+          <label>git 地址</label>
+          <input v-model="form.url" class="mono" placeholder="git@github.com:org/repo.git" />
+        </div>
+        <div class="field">
+          <label>显示名称</label>
+          <input v-model="form.name" placeholder="可选，默认取 org/repo" />
         </div>
       </div>
-    </template>
-    <template v-else>
-      <div class="row between">
+      <div class="field">
+        <label>测试说明</label>
+        <textarea v-model="form.test_notes" rows="6" :placeholder="notesPlaceholder" />
+      </div>
+      <div class="row"><button class="btn primary" :disabled="!form.url.trim()"><Plus :size="15" /> 添加</button></div>
+    </form>
+
+    <div v-if="!list.length && !adding" class="card">
+      <div class="empty">
+        <span class="empty-icon"><GitBranch :size="24" /></span>
+        <h3>还没有仓库</h3>
+        <button class="btn primary" @click="adding = true"><Plus :size="16" /> 添加仓库</button>
+      </div>
+    </div>
+
+    <section v-for="r in list" :key="r.id" class="card stack" style="gap: 14px">
+      <template v-if="editing && editing.id === r.id">
+        <div class="grid-2">
+          <div class="field"><label>git 地址</label><input v-model="editing.url" class="mono" /></div>
+          <div class="field"><label>显示名称</label><input v-model="editing.name" /></div>
+        </div>
+        <div class="field"><label>测试说明</label><textarea v-model="editing.test_notes" rows="8" :placeholder="notesPlaceholder" /></div>
+        <div class="row">
+          <button class="btn primary" @click="save">保存</button>
+          <button class="btn ghost" @click="editing = null">取消</button>
+        </div>
+      </template>
+      <template v-else>
+        <div class="row between">
+          <div class="row" style="gap: 10px; min-width: 0">
+            <span class="choice-icon"><GitBranch :size="17" /></span>
+            <div style="min-width: 0">
+              <b>{{ r.name }}</b>
+              <div class="mono muted" style="overflow-wrap: anywhere">{{ r.url }}</div>
+            </div>
+          </div>
+          <div class="row" style="gap: 2px">
+            <button class="btn ghost icon" title="编辑" @click="editing = { ...r }"><PencilLine :size="15" /></button>
+            <button class="btn ghost icon danger" title="删除" @click="remove(r)"><Trash2 :size="15" /></button>
+          </div>
+        </div>
         <div>
-          <b>{{ r.name }}</b>
-          <div class="mono muted">{{ r.url }}</div>
+          <div class="label row" style="gap: 6px; margin-bottom: 6px"><NotebookPen :size="12" /> 测试说明</div>
+          <p class="body text-2" :class="{ muted: !r.test_notes }">{{ r.test_notes || '未填写，建议补充启动方式和依赖。' }}</p>
         </div>
-        <div class="row">
-          <button class="small" @click="edit(r)">编辑</button>
-          <button class="small danger" @click="remove(r)">删除</button>
+        <div class="hint row" style="gap: 6px">
+          <KeyRound :size="12" /> 私密文件放在运行时的 <code>~/.verdict-agent/env/{{ repoKey(r.url) }}/</code>，每次测试复制到代码根目录，不经过本站。
         </div>
-      </div>
-      <div class="muted">测试说明</div>
-      <p class="body">{{ r.test_notes || '（未填写）' }}</p>
-      <div class="muted small-text">
-        私密文件（如 .env）放在运行时的 <code>~/.verdict-agent/env/{{ repoKey(r.url) }}/</code>，每次测试会复制到代码根目录，不经过本后端。
-      </div>
-    </template>
+      </template>
+    </section>
   </div>
 </template>

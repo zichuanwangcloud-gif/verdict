@@ -49,3 +49,17 @@ export function ago(t) {
   if (s < 86400) return `${Math.floor(s / 3600)} 小时前`
   return `${Math.floor(s / 86400)} 天前`
 }
+
+export function acCounts(acs = []) {
+  const c = { pass: 0, fail: 0, unverifiable: 0, total: acs.length }
+  for (const a of acs) {
+    if (a.status === 'pass') c.pass++
+    else if (a.status === 'fail') c.fail++
+    else c.unverifiable++
+  }
+  return c
+}
+
+export const isLive = (run) => ['queued', 'dispatched', 'preparing', 'running'].includes(run?.status)
+
+export const harnessName = (h) => ({ claude: 'Claude Code', codex: 'Codex' })[h] || h
