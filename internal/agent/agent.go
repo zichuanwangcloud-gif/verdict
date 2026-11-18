@@ -111,6 +111,7 @@ func memTotalMB() int {
 // 退出时先在连接仍然可用的情况下收尾当前测试，让后端立即知道测试中断，再断开连接。
 func (a *Agent) Run(ctx context.Context) error {
 	killLeftovers(a.dir)
+	teardownLeftovers(a.dir)
 	a.recoverInterrupted()
 	go a.housekeeping(ctx)
 

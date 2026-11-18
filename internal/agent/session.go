@@ -332,6 +332,11 @@ func (a *Agent) closeSession(s *session, res protocol.ClosedResult, keepWorktree
 		logf("停止托管服务")
 		svc.Stop()
 	}
+	workDir := ""
+	if prep != nil {
+		workDir = prep.Dir
+	}
+	runTeardown(a.dir, s.runID, workDir, logf)
 	composeDown(ctx, s.runID, logf)
 	if prep != nil {
 		res.SourceModified, res.Diff = prep.Changes(ctx)

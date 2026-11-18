@@ -64,7 +64,7 @@ function repoKey(url) {
   return u || 'repo'
 }
 
-const notesPlaceholder = '交给 agent 的测试说明：\n- 怎么安装依赖、怎么启动服务\n- 依赖哪些外部服务（数据库、缓存…）\n- 测试账号、端口、注意事项'
+const notesPlaceholder = '可以不填，agent 会读代码推断；写了会更稳。例如：\n- 依赖：运行时上已有 postgres 容器 my-pg（用户 app / 密码 xxx）和 redis 容器 my-redis，建独立库即可\n- 初始化：服务启动时自动建表；管理员账号由 ADMIN_EMAIL / ADMIN_PASSWORD 生成\n- 注意：前端在 apps/web 下，单独 pnpm install'
 </script>
 
 <template>

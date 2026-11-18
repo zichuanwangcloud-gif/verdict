@@ -199,7 +199,7 @@ func serviceSpec(repo RepoInfo, p *Plan) (protocol.ServiceSpec, bool) {
 	s := protocol.ServiceSpec{SetupCmd: repo.SetupCmd, StartCmd: repo.StartCmd, HealthURL: repo.HealthURL, AppURL: repo.AppURL}
 	fromRepo := s.StartCmd != ""
 	if p != nil && !fromRepo {
-		s.SetupCmd, s.StartCmd = p.Service.SetupCmd, p.Service.StartCmd
+		s.SetupCmd, s.StartCmd, s.TeardownCmd = p.Service.SetupCmd, p.Service.StartCmd, p.Service.TeardownCmd
 		if s.HealthURL == "" {
 			s.HealthURL = p.Service.HealthURL
 		}

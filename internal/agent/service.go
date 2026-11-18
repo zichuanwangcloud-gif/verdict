@@ -148,8 +148,15 @@ func (a *Agent) startService(ctx context.Context, s *session, spec protocol.Serv
 	// 但健康检查和前端地址是 agent 自己发 HTTP 请求用的，不会经过 shell，必须在这里替换。
 	spec.SetupCmd, spec.StartCmd = s.expand(spec.SetupCmd), s.expand(spec.StartCmd)
 	spec.HealthURL, spec.AppURL = s.expand(spec.HealthURL), s.expand(spec.AppURL)
-	st := protocol.ServiceStatus{StartCmd: spec.StartCmd, HealthURL: spec.HealthURL, URL: firstNonEmpty(spec.AppURL, spec.HealthURL)}
+	spec.TeardownCmd = s.expand(spec.TeardownCmd)
+	st := protocol.ServiceStatus{StartCmd: spec.StartCmd, HealthURL: spec.HealthURL, URL: firstNonEmpty(spec.AppURL, spec.HealthURL),
+		TeardownCmd: spec.TeardownCmd}
 	env := s.env()
+
+	// 重新启动服务（续跑、重试）时，先清理上一次建的资源，安装命令就能从干净状态重建。
+	// 清理命令要在安装之前登记：安装失败时可能已经建了一半的库，收尾时同样要删。
+	runTeardown(a.dir, s.runID, s.prep.Dir, logf)
+	saveTeardown(a.dir, s.runID, spec.TeardownCmd, env)
 
 	if strings.TrimSpace(spec.SetupCmd) != "" {
 		logf("▶ 安装依赖：" + spec.SetupCmd)

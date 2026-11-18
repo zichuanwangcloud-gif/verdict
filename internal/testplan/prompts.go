@@ -9,6 +9,11 @@ import (
 
 const evidenceClip = 3000
 
+// dataPrepRule 说明测试数据由测试自己准备：数据不足不算环境缺失。
+const dataPrepRule = `- 测试数据：前置条件需要的数据（数据量、状态、账号）不够时，自己在本次专用的库里造出来再测，造了什么、怎么造的写进 evidence。数据不足**不属于**环境缺失，不能因此判 unverifiable。
+  写入前先确认服务连的是本次专用的库（库名以 verdict_ 开头并带本次测试编号，或者是平台 compose 项目起的实例）；连的是别人在用的库时不要写入，判 unverifiable 并说明「需要造数，但服务连的不是独立库」。
+`
+
 func roleIntro(role string, round int, cfg Config) string {
 	switch role {
 	case RolePlan:
@@ -48,7 +53,7 @@ func buildPrompt(role string, round int, cfg Config, in Input, recs []StageRecor
 	b.WriteString("## 本阶段任务\n")
 	switch role {
 	case RolePlan:
-		writePlanTask(&b, cfg)
+		writePlanTask(&b, cfg, in)
 	case RoleVerify:
 		writeVerifyTask(&b, cfg, in, plan, recs)
 	case RoleUI:
@@ -162,6 +167,9 @@ func serviceContext(cfg Config, in Input, recs []StageRecord) string {
 		if s.LogFile != "" {
 			fmt.Fprintf(&b, "- 服务日志：%s（排查问题时可以读）\n", s.LogFile)
 		}
+		if s.TeardownCmd != "" {
+			fmt.Fprintf(&b, "- 收尾清理命令（平台会在测试结束时执行）：`%s`\n", s.TeardownCmd)
+		}
 		b.WriteString("不要停止或重启它；如果你确实需要以不同配置运行，另起一个端口。")
 		return b.String()
 	default:
@@ -176,18 +184,47 @@ func serviceContext(cfg Config, in Input, recs []StageRecord) string {
 	}
 }
 
-func writePlanTask(b *strings.Builder, cfg Config) {
+func writePlanTask(b *strings.Builder, cfg Config, in Input) {
 	b.WriteString(`输出测试计划：
 1. 把需求中的验收标准拆成可以独立验证的条目，编号 AC-1、AC-2……。需求没有明确列出验收标准时，从需求描述中提炼可验证的条目。
 2. 为每条选择验证方式 method：cli（命令行、单元测试）、api（对运行中的服务发请求）、ui（需要在浏览器里操作页面）、code（只能通过阅读代码判断）。能实测的不要选 code。
 3. 每条写清前置条件 preconditions、具体步骤 steps（具体到命令、接口、页面）和预期现象 expected。
+   前置条件需要特定数据（数据量、状态、账号、权限）而环境里不一定有的，steps 里要写出造数方法（插多少条、用 SQL 还是接口、覆盖哪个时间范围），在本次的独立库里造出来再测。**不要把「数据不足」写成判无法验证的条件**，数据是测试自己要准备的。
 4. 判断验证是否需要把服务跑起来（needs_service），并给出 service 建议：安装依赖命令 setup_cmd、**前台运行**的启动命令 start_cmd（不要加 &、nohup，平台会托管它在后台运行）、健康检查地址 health_url、前端入口地址 app_url。仓库维护者已经提供的，以维护者的为准。用不上的字段填空字符串。
    端口一律用占位符 ${VERDICT_PORT}（第 2、3 个端口写成 ${VERDICT_PORT2}、${VERDICT_PORT3}），**不要写死 3000 这样的端口号**：平台会同时跑多个测试，写死会互相冲突。
 5. summary 用一两句话说明测试思路。
 `)
+	if !cfg.BriefPlan {
+		b.WriteString(dataIsolationRules(in.RunID))
+	}
 	if cfg.BriefPlan {
 		b.WriteString("\n本档位只做静态与命令行验证：条目保持精简，method 只能用 cli 或 code，needs_service 填 false。\n")
 	}
+}
+
+// dataIsolationRules 要求被测服务使用本次测试专用的数据库 / 缓存，造的数据随收尾一起删除。
+func dataIsolationRules(runID string) string {
+	db := DataName(runID)
+	return fmt.Sprintf(`6. 数据隔离：被测服务用到的数据库、缓存等有状态依赖，必须使用本次测试专用的实例，**不要直接连别人在用的业务库**。
+   - 运行时上已经有对应容器（例如在运行的 postgres、mysql、redis）的，可以复用容器，但要在里面新建本次专用的库，库名用 `+"`%[1]s`"+`；redis 选一个当前为空的 db 编号（DBSIZE 为 0），先用 `+"`SET verdict:owner %[2]s NX`"+` 占用，占用失败就换一个编号。
+   - 没有现成容器的，用 docker compose 起临时依赖，项目名用 `+"`verdict-%[2]s`"+`，平台收尾时会删除。
+   - 建库、执行迁移、初始化管理员账号等步骤写进 setup_cmd；start_cmd 里让服务连到这个专用库和专用编号。
+   - teardown_cmd 填收尾时的清理命令：删除专用库（DROP DATABASE IF EXISTS %[1]s），对 redis 先确认 verdict:owner 仍是 %[2]s 再 FLUSHDB。teardown_cmd 只能删除本次创建的资源。平台会在测试结束（含失败、取消）时执行它，重新启动服务前也会先执行一次，所以 setup_cmd 可以假设从干净状态开始。
+   - 用 docker compose 起的临时依赖由平台清理，teardown_cmd 填空字符串即可。
+`, db, runID)
+}
+
+// DataName 返回本次测试专用数据库的名字：只含小写字母、数字和下划线，各类数据库都能直接用。
+func DataName(runID string) string {
+	var b strings.Builder
+	for _, r := range strings.ToLower(runID) {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') {
+			b.WriteRune(r)
+		} else {
+			b.WriteByte('_')
+		}
+	}
+	return "verdict_" + b.String()
 }
 
 func writeVerifyTask(b *strings.Builder, cfg Config, in Input, plan *Plan, recs []StageRecord) {
@@ -203,7 +240,7 @@ func writeVerifyTask(b *strings.Builder, cfg Config, in Input, plan *Plan, recs 
 2. evidence 写清执行了什么、关键输出是什么（原样摘录）。没有证据不能判 pass。
 3. 因环境、依赖、凭据缺失等原因无法验证的，判 unverifiable，并写清缺什么。不要猜测，不要硬判 pass。
 4. 条目编号与计划保持一致；response 填空字符串。summary 用中文总结整体情况。
-`)
+` + dataPrepRule)
 	if cfg.StaticOnly {
 		b.WriteString("5. 本档位只用命令行、单元测试和阅读代码验证；需要运行服务或浏览器的条目判 unverifiable。\n")
 	} else if cfg.UI != UINone {
@@ -263,7 +300,7 @@ func writeRedTask(b *strings.Builder, plan *Plan, cur Result) {
 	b.WriteString(`你可以在工作区里自行执行命令、发请求来复核（不要修改被测源码，不要停止平台托管的服务）。逐条检查：
 - 证据是否真的来自实际执行、是否直接支撑结论？是不是只读了代码就判了通过？
 - 是否存在反例：边界输入、异常路径、权限、空数据、并发？
-- 判 fail 的，会不会其实是测试方法或环境的问题？判 unverifiable 的，是不是其实可以验证？
+- 判 fail 的，会不会其实是测试方法或环境的问题？判 unverifiable 的，是不是其实可以验证？特别是因为「数据不足」判的，能不能在独立库里造数据后实测？
 - 结果是否可能不稳定？
 
 只在有具体理由时提出质疑。每条质疑写清 claim（问题是什么）、suggested_check（建议怎么复核，尽量给出可以直接执行的命令或步骤）、proposed_status（你认为应该是什么结论）。站得住的结论不要提；没有任何质疑时 challenges 为空数组。
@@ -283,7 +320,7 @@ func writeRecheckTask(b *strings.Builder, cfg Config, round int, cur Result) {
 - 按质疑内容和建议的复核方式实际执行，给出更新后的 status、evidence、reasoning、confidence；
 - 在 response 里直接回应质疑：认同就修正结论，不认同就用新的证据说明原结论成立。
 acs 只输出被质疑的条目，编号保持不变。summary 用中文总结复测结果。
-`)
+` + dataPrepRule)
 	if cfg.Stability {
 		b.WriteString("关键检查至少独立执行两次；结果不一致的判 unverifiable。\n")
 	}
