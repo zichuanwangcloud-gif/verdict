@@ -80,8 +80,8 @@ func TestStagesLifecycle(t *testing.T) {
 	if err != nil || run.Tier != "A" || run.Config.RedRounds != 1 || run.TimeoutMinutes != 90 || run.Legacy() {
 		t.Fatalf("%v %+v", err, run)
 	}
-	s1, _ := st.AddStage(ctx, run.ID, testplan.StageSpec{Role: "plan", Kind: "harness", Harness: "claude", Prompt: "p"}, testplan.StatusPending, "")
-	s2, _ := st.AddStage(ctx, run.ID, testplan.StageSpec{Role: "ui"}, testplan.StatusSkipped, "预算")
+	s1, _ := st.AddStage(ctx, run.ID, testplan.StageSpec{Role: "plan", Kind: "harness", Harness: "claude", Prompt: "p"}, testplan.StatusPending, "", 1)
+	s2, _ := st.AddStage(ctx, run.ID, testplan.StageSpec{Role: "ui"}, testplan.StatusSkipped, "预算", 1)
 	if s1.Seq != 1 || s2.Seq != 2 || s2.FinishedAt == nil || s1.Spec.Prompt != "p" {
 		t.Fatalf("阶段不对: %+v %+v", s1, s2)
 	}

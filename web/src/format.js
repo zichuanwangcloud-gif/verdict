@@ -122,6 +122,11 @@ export function fmtMs(ms) {
   return m < 60 ? `${m} 分 ${s % 60} 秒` : `${Math.floor(m / 60)} 小时 ${m % 60} 分`
 }
 
+export const failureKindText = { transient: '网关抖动', auth: '凭据问题', other: '其它失败' }
+export const roleText = {
+  ui: 'UI 走查', red: '红队质疑', explore: '主动探索', judge: '裁决',
+}
+
 export const versionStatusText = { open: '开发中', frozen: '已冻结', released: '已发布' }
 export const regressionStatusText = { running: '进行中', completed: '已结束', canceled: '已取消' }
 export const regressionVerdictText = { pass: '通过', fail: '未通过', partial: '部分无法验证', incomplete: '未完成' }

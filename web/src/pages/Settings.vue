@@ -1,11 +1,13 @@
 <script setup>
 import { ref, onMounted } from 'vue'
-import { KeyRound, Globe, Sparkles, Check, Trash2 } from 'lucide-vue-next'
+import { KeyRound, Globe, Sparkles, Check, Trash2, RefreshCw } from 'lucide-vue-next'
 import { api } from '../api'
 
 const s = ref(null)
 const key = ref('')
 const publicURL = ref('')
+const retries = ref(5)
+const retryDelay = ref(1)
 const err = ref('')
 const msg = ref('')
 
@@ -13,6 +15,8 @@ async function load() {
   try {
     s.value = await api.settings()
     publicURL.value = s.value.public_url
+    retries.value = s.value.stage_retries ?? 5
+    retryDelay.value = Math.max(1, Math.round((s.value.stage_retry_delay ?? 60) / 60))
   } catch (e) {
     err.value = e.message
   }
@@ -56,6 +60,24 @@ async function save(body) {
           <button class="btn primary" :disabled="!key.trim()">保存</button>
           <button v-if="s.linear_api_key_masked" type="button" class="btn danger" @click="save({ linear_api_key: '' })"><Trash2 :size="14" /></button>
         </div>
+      </form>
+
+      <form class="card stack" style="gap: 14px" @submit.prevent="save({ stage_retries: Number(retries), stage_retry_delay: Number(retryDelay) * 60 })">
+        <div class="card-title"><RefreshCw :size="16" /> 阶段重试</div>
+        <p class="text-2">模型网关抖动、限流、连接中断这类失败会自动重试。重试的耗时计入测试的时间预算；次数用尽仍未成功时，报告会标注「覆盖强度降级」，缺少裁决时结论降为存疑。</p>
+        <div class="grid-2">
+          <div class="field">
+            <label>单个阶段最多尝试次数</label>
+            <input v-model.number="retries" type="number" min="0" max="20" />
+            <span class="hint">含第一次执行，默认 5。0 表示不重试。</span>
+          </div>
+          <div class="field">
+            <label>首次重试间隔（分钟）</label>
+            <input v-model.number="retryDelay" type="number" min="1" max="60" />
+            <span class="hint">之后指数退避（×2），上限 8 分钟。</span>
+          </div>
+        </div>
+        <div class="row"><button class="btn primary">保存</button></div>
       </form>
 
       <form class="card stack" style="gap: 14px" @submit.prevent="save({ public_url: publicURL })">

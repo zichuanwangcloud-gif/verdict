@@ -189,6 +189,11 @@ var migrations = []struct{ table, column, def string }{
 	{"runs", "ports", "TEXT NOT NULL DEFAULT '[]'"},
 	{"runtimes", "concurrency", "INTEGER NOT NULL DEFAULT 0"},
 	{"repos", "ports", "INTEGER NOT NULL DEFAULT 1"},
+	{"runs", "parent_run_id", "TEXT NOT NULL DEFAULT ''"},
+	{"runs", "coverage", "TEXT NOT NULL DEFAULT '{}'"},
+	{"stages", "failure_kind", "TEXT NOT NULL DEFAULT ''"},
+	{"stages", "attempt", "INTEGER NOT NULL DEFAULT 1"},
+	{"stages", "next_attempt_at", "TEXT NOT NULL DEFAULT ''"},
 }
 
 // 测试状态。
@@ -273,6 +278,7 @@ func migrate(db *sql.DB) error {
 		`CREATE INDEX IF NOT EXISTS stages_run ON stages(run_id, seq)`,
 		`CREATE INDEX IF NOT EXISTS runs_version ON runs(version_id)`,
 		`CREATE INDEX IF NOT EXISTS runs_regression ON runs(regression_id)`,
+		`CREATE INDEX IF NOT EXISTS runs_parent ON runs(parent_run_id)`,
 	} {
 		if _, err := db.Exec(q); err != nil {
 			return err

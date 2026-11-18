@@ -30,6 +30,8 @@ const (
 	StatusTimeout  = protocol.StageTimeout
 	StatusCanceled = protocol.StageCanceled
 	StatusSkipped  = "skipped"
+	// StatusRetryWait 表示阶段失败但可重试，正在退避等待。
+	StatusRetryWait = "retry_wait"
 )
 
 // Done 表示阶段已有结果。

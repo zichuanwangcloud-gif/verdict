@@ -23,6 +23,9 @@ import (
 const (
 	settingLinearKey = "linear_api_key"
 	settingPublicURL = "public_url"
+	// SettingStageRetries / SettingRetryDelay 是阶段重试设置，页面「设置」可改。
+	SettingStageRetries = "stage_retries"
+	SettingRetryDelay   = "stage_retry_delay_seconds"
 )
 
 var harnesses = []string{"claude", "codex"}
@@ -140,6 +143,7 @@ func (s *Server) Handler() http.Handler {
 	api.HandleFunc("POST /api/runs/{id}/cancel", s.cancelRun)
 	api.HandleFunc("POST /api/runs/{id}/approve", s.approveRun)
 	api.HandleFunc("POST /api/runs/{id}/rerun", s.rerun)
+	api.HandleFunc("POST /api/runs/{id}/resume", s.resumeRun)
 	api.HandleFunc("POST /api/runs/{id}/linear", s.retryWriteBack)
 	api.HandleFunc("GET /api/runs/{id}/artifacts/{name}", s.getArtifact)
 
@@ -216,6 +220,13 @@ func linearClient(key string) *linear.Client {
 	return c
 }
 
+func intOr(s string, def int) int {
+	if n, err := strconv.Atoi(s); err == nil {
+		return n
+	}
+	return def
+}
+
 func (s *Server) linearKey(ctx context.Context) string {
 	if v, _ := s.st.Setting(ctx, settingLinearKey); v != "" {
 		return v
@@ -259,10 +270,14 @@ func (s *Server) getSettings(w http.ResponseWriter, r *http.Request) {
 	} else if key != "" {
 		masked = "已配置"
 	}
+	retries, _ := s.st.Setting(r.Context(), SettingStageRetries)
+	delay, _ := s.st.Setting(r.Context(), SettingRetryDelay)
 	ok(w, map[string]any{
 		"linear_api_key_masked": masked,
 		"public_url":            pub,
 		"public_url_effective":  s.publicURL(r.Context(), r),
+		"stage_retries":         intOr(retries, testplan.DefaultStageRetries),
+		"stage_retry_delay":     intOr(delay, testplan.DefaultRetryDelaySecs),
 	})
 }
 
@@ -270,6 +285,8 @@ func (s *Server) putSettings(w http.ResponseWriter, r *http.Request) {
 	var in struct {
 		LinearAPIKey *string `json:"linear_api_key"`
 		PublicURL    *string `json:"public_url"`
+		StageRetries *int    `json:"stage_retries"`
+		RetryDelay   *int    `json:"stage_retry_delay"` // 秒
 	}
 	if err := decode(r, &in); err != nil {
 		fail(w, http.StatusBadRequest, err.Error())
@@ -277,6 +294,20 @@ func (s *Server) putSettings(w http.ResponseWriter, r *http.Request) {
 	}
 	if in.LinearAPIKey != nil {
 		if err := s.st.SetSetting(r.Context(), settingLinearKey, strings.TrimSpace(*in.LinearAPIKey)); err != nil {
+			failErr(w, err)
+			return
+		}
+	}
+	if in.StageRetries != nil {
+		n := max(0, min(*in.StageRetries, testplan.MaxStageRetries))
+		if err := s.st.SetSetting(r.Context(), SettingStageRetries, strconv.Itoa(n)); err != nil {
+			failErr(w, err)
+			return
+		}
+	}
+	if in.RetryDelay != nil {
+		n := max(1, min(*in.RetryDelay, 3600))
+		if err := s.st.SetSetting(r.Context(), SettingRetryDelay, strconv.Itoa(n)); err != nil {
 			failErr(w, err)
 			return
 		}

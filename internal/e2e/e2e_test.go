@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -60,6 +61,36 @@ type fake struct {
 	// active / maxActive 记录同时执行的 harness 调用数，用于验证并发度。
 	active    int
 	maxActive int
+	// tries 记录每个角色被执行的次数，用于验证阶段重试。
+	tries map[string]int
+}
+
+// flakyCount 从提示词里读 FLAKY_N（所有角色）或 FLAKY:角色:N（指定角色），返回该角色前 N 次应失败。
+func flakyCount(prompt string) int {
+	if i := strings.Index(prompt, "FLAKY:"); i >= 0 {
+		role := role(prompt)
+		rest := prompt[i+len("FLAKY:"):]
+		name, count, ok := strings.Cut(rest, ":")
+		if !ok || name != role {
+			return 0
+		}
+		n, _ := strconv.Atoi(strings.TrimSpace(strings.Fields(count)[0]))
+		return n
+	}
+	i := strings.Index(prompt, "FLAKY_")
+	if i < 0 {
+		return 0
+	}
+	j := i + len("FLAKY_")
+	k := j
+	for k < len(prompt) && prompt[k] >= '0' && prompt[k] <= '9' {
+		k++
+	}
+	if k == j {
+		return 0
+	}
+	n, _ := strconv.Atoi(prompt[j:k])
+	return n
 }
 
 func (f *fake) Name() string { return f.name }
@@ -76,6 +107,9 @@ func (f *fake) calls() []string {
 func (f *fake) Run(ctx context.Context, spec harness.RunSpec) (harness.Output, error) {
 	r := role(spec.Prompt)
 	f.mu.Lock()
+	if f.tries == nil {
+		f.tries = map[string]int{}
+	}
 	f.log = append(f.log, r)
 	f.active++
 	if f.active > f.maxActive {
@@ -93,6 +127,16 @@ func (f *fake) Run(ctx context.Context, spec harness.RunSpec) (harness.Output, e
 	}
 	if f.name == "codex" && strings.Contains(spec.Prompt, "CODEX_DOWN") {
 		return harness.Output{}, fmt.Errorf("stream disconnected")
+	}
+	// FLAKY_N：同一个角色前 N 次用网关抖动失败，之后成功，用来验证重试。
+	if n := flakyCount(spec.Prompt); n > 0 {
+		f.mu.Lock()
+		f.tries[r]++
+		tries := f.tries[r]
+		f.mu.Unlock()
+		if tries <= n {
+			return harness.Output{}, fmt.Errorf("stream disconnected before completion")
+		}
 	}
 	out := func(v any) (harness.Output, error) {
 		b, _ := json.Marshal(v)
