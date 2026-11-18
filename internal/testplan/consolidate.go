@@ -15,6 +15,8 @@ type Result struct {
 	ACs      []protocol.ACResult `json:"acs"`
 	Findings []protocol.Finding  `json:"findings"`
 	Pages    []UIPage            `json:"pages"`
+	Shots    []Shot              `json:"shots"`
+	ShotRevs []ShotReview        `json:"shot_reviews"`
 	Coverage Coverage            `json:"coverage"`
 }
 
@@ -174,6 +176,7 @@ func Consolidate(cfg Config, recs []StageRecord) Result {
 				}
 			}
 			res.Pages = append(res.Pages, out.Pages...)
+			res.Shots = append(res.Shots, out.Shots...)
 			addFindings(out.Findings, RoleUI)
 
 		case RoleRed:
@@ -262,6 +265,8 @@ func Consolidate(cfg Config, recs []StageRecord) Result {
 			a.Reasoning = strings.TrimSpace(a.Reasoning + "\n（平台：判为通过但缺少证据，降为无法验证）")
 		}
 	}
+	// 硬约束：证据引用的截图全部不可用时，通过结论同样不成立。
+	applyShotGate(&res, shotVerdict(recs))
 
 	sort.SliceStable(res.Findings, func(i, j int) bool {
 		return severityRank[res.Findings[i].Severity] < severityRank[res.Findings[j].Severity]
@@ -290,6 +295,13 @@ func Consolidate(cfg Config, recs []StageRecord) Result {
 	}
 	if res.Findings == nil {
 		res.Findings = []protocol.Finding{}
+	}
+	if res.Shots == nil {
+		res.Shots = []Shot{}
+	}
+	res.ShotRevs = ShotReviewOf(recs)
+	if res.ShotRevs == nil {
+		res.ShotRevs = []ShotReview{}
 	}
 	return res
 }

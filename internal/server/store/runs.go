@@ -35,6 +35,7 @@ type Run struct {
 	ACs              []protocol.ACResult `json:"acs"`
 	Findings         []protocol.Finding  `json:"findings"`
 	Pages            []testplan.UIPage   `json:"pages"`
+	Shots            []testplan.Shot     `json:"shots"`
 	Approved         bool                `json:"approved"`
 	ApprovalNote     string              `json:"approval_note"`
 	AwaitingSince    *time.Time          `json:"awaiting_since"`
@@ -66,18 +67,18 @@ const runCols = `r.id, r.repo_id, p.url, p.name, p.ports, r.branch, r.commit_sha
  r.harness, r.tier, r.config, r.timeout_minutes, r.status, r.current_stage, r.verdict, r.summary, r.acs, r.findings, r.pages,
  r.approved, r.approval_note, r.awaiting_since, r.source_modified, r.diff, r.prompt, r.raw, r.cost_usd, r.error,
  r.linear_comment_url, r.linear_error, r.version_id, r.regression_id, r.case_id, r.pin_ref, r.pin_sha, r.plan_source,
- r.preset_plan, r.ports, r.parent_run_id, r.coverage, r.attempt, r.created_at, r.started_at, r.finished_at
+ r.preset_plan, r.ports, r.parent_run_id, r.coverage, r.attempt, r.created_at, r.started_at, r.finished_at, r.shots
  FROM runs r JOIN repos p ON p.id=r.repo_id JOIN runtimes t ON t.id=r.runtime_id`
 
 func scanRun(sc interface{ Scan(...any) error }) (Run, error) {
 	var r Run
-	var issue, cfg, acs, findings, pages, awaiting, ports, cov, created, started, finished string
+	var issue, cfg, acs, findings, pages, shots, awaiting, ports, cov, created, started, finished string
 	var modified, approved int
 	err := sc.Scan(&r.ID, &r.RepoID, &r.RepoURL, &r.RepoName, &r.RepoPorts, &r.Branch, &r.CommitSHA, &r.IssueKey, &issue, &r.RuntimeID,
 		&r.RuntimeName, &r.Harness, &r.Tier, &cfg, &r.TimeoutMinutes, &r.Status, &r.CurrentStage, &r.Verdict, &r.Summary,
 		&acs, &findings, &pages, &approved, &r.ApprovalNote, &awaiting, &modified, &r.Diff, &r.Prompt, &r.Raw, &r.CostUSD,
 		&r.Error, &r.LinearCommentURL, &r.LinearError, &r.VersionID, &r.RegressionID, &r.CaseID, &r.PinRef, &r.PinSHA,
-		&r.PlanSource, &r.PresetPlan, &ports, &r.ParentRunID, &cov, &r.Attempt, &created, &started, &finished)
+		&r.PlanSource, &r.PresetPlan, &ports, &r.ParentRunID, &cov, &r.Attempt, &created, &started, &finished, &shots)
 	if err != nil {
 		return r, err
 	}
@@ -86,6 +87,10 @@ func scanRun(sc interface{ Scan(...any) error }) (Run, error) {
 	_ = json.Unmarshal([]byte(acs), &r.ACs)
 	_ = json.Unmarshal([]byte(findings), &r.Findings)
 	_ = json.Unmarshal([]byte(pages), &r.Pages)
+	_ = json.Unmarshal([]byte(shots), &r.Shots)
+	if r.Shots == nil {
+		r.Shots = []testplan.Shot{}
+	}
 	if r.ACs == nil {
 		r.ACs = []protocol.ACResult{}
 	}
@@ -271,8 +276,8 @@ func (s *Store) SetCurrentStage(ctx context.Context, id, stage string) error {
 
 // SetResult 写入当前汇总结论（执行过程中随阶段更新）。
 func (s *Store) SetResult(ctx context.Context, id string, res testplan.Result, cost float64) error {
-	_, err := s.db.ExecContext(ctx, `UPDATE runs SET summary=?, acs=?, findings=?, pages=?, coverage=?, cost_usd=? WHERE id=?`,
-		res.Summary, toJSON(res.ACs), toJSON(res.Findings), toJSON(res.Pages), toJSON(res.Coverage), cost, id)
+	_, err := s.db.ExecContext(ctx, `UPDATE runs SET summary=?, acs=?, findings=?, pages=?, shots=?, coverage=?, cost_usd=? WHERE id=?`,
+		res.Summary, toJSON(res.ACs), toJSON(res.Findings), toJSON(res.Pages), toJSON(res.Shots), toJSON(res.Coverage), cost, id)
 	return err
 }
 

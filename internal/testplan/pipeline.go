@@ -14,6 +14,7 @@ const (
 	RoleService = "service"
 	RoleVerify  = "verify"
 	RoleUI      = "ui"
+	RoleShots   = "shots"
 	RoleRed     = "red"
 	RoleRecheck = "recheck"
 	RoleExplore = "explore"
@@ -59,6 +60,8 @@ type StageRecord struct {
 	DurationMS int64                   `json:"duration_ms"`
 	Service    *protocol.ServiceStatus `json:"service,omitempty"`
 	Artifacts  []string                `json:"artifacts"`
+	// ArtifactIssues 是 agent 对产物的基础检查结果，只作提示。
+	ArtifactIssues []protocol.ArtifactIssue `json:"artifact_issues,omitempty"`
 }
 
 type RepoInfo struct {
@@ -111,8 +114,8 @@ type Step struct {
 
 // 各阶段默认超时与最短所需时间（分钟）。
 var (
-	defaultTimeout = map[string]int{RolePlan: 15, RoleService: 20, RoleVerify: 60, RoleUI: 30, RoleRed: 20, RoleRecheck: 25, RoleExplore: 30, RoleJudge: 10}
-	minMinutes     = map[string]int{RoleUI: 5, RoleRed: 4, RoleRecheck: 4, RoleExplore: 5, RoleJudge: 2}
+	defaultTimeout = map[string]int{RolePlan: 15, RoleService: 20, RoleVerify: 60, RoleUI: 30, RoleShots: 12, RoleRed: 20, RoleRecheck: 25, RoleExplore: 30, RoleJudge: 10}
+	minMinutes     = map[string]int{RoleUI: 5, RoleShots: 3, RoleRed: 4, RoleRecheck: 4, RoleExplore: 5, RoleJudge: 2}
 )
 
 func latest(recs []StageRecord, role string, round int) *StageRecord {
@@ -286,7 +289,23 @@ func Next(cfg Config, in Input, recs []StageRecord) Step {
 		return harnessStage(RoleUI, 0, cfg.Harness, true)
 	}
 
-	// 5. 红蓝循环
+	// 5. 截图质检：UI 走查产出了截图时，用新会话只读图判断能不能当证据。
+	if cfg.ShotReview && latest(recs, RoleShots, 0) == nil {
+		uiRec := latest(recs, RoleUI, 0)
+		shots := Consolidate(cfg, recs).Shots
+		switch {
+		case uiRec == nil || uiRec.Status != StatusOK:
+			// UI 走查没有成功，没有可质检的截图；不记一条跳过，避免噪音。
+		case len(shots) == 0:
+			return skip(RoleShots, 0, "UI 走查没有登记截图")
+		case lacks(cfg, recs, RoleShots) != "":
+			return skip(RoleShots, 0, lacks(cfg, recs, RoleShots))
+		default:
+			return harnessStage(RoleShots, 0, cfg.Harness, false)
+		}
+	}
+
+	// 6. 红蓝循环
 	redHarness := cfg.RedHarness
 	for round := 1; round <= cfg.RedRounds; round++ {
 		red := latest(recs, RoleRed, round)
@@ -323,7 +342,7 @@ func Next(cfg Config, in Input, recs []StageRecord) Step {
 		}
 	}
 
-	// 6. 主动探索
+	// 7. 主动探索
 	if cfg.Explore && latest(recs, RoleExplore, 0) == nil {
 		if r := lacks(cfg, recs, RoleExplore); r != "" {
 			return skip(RoleExplore, 0, r)
@@ -331,7 +350,7 @@ func Next(cfg Config, in Input, recs []StageRecord) Step {
 		return harnessStage(RoleExplore, 0, cfg.Harness, false)
 	}
 
-	// 7. 裁决
+	// 8. 裁决
 	if cfg.Judge && latest(recs, RoleJudge, 0) == nil {
 		if r := lacks(cfg, recs, RoleJudge); r != "" {
 			return skip(RoleJudge, 0, r)

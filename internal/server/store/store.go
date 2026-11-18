@@ -59,6 +59,7 @@ CREATE TABLE IF NOT EXISTS runs (
   error TEXT NOT NULL DEFAULT '',
   linear_comment_url TEXT NOT NULL DEFAULT '',
   linear_error TEXT NOT NULL DEFAULT '',
+  shots TEXT NOT NULL DEFAULT '[]',
   created_at TEXT NOT NULL,
   started_at TEXT NOT NULL DEFAULT '',
   finished_at TEXT NOT NULL DEFAULT ''
@@ -92,6 +93,7 @@ CREATE TABLE IF NOT EXISTS stages (
   duration_ms INTEGER NOT NULL DEFAULT 0,
   service TEXT NOT NULL DEFAULT 'null',
   artifacts TEXT NOT NULL DEFAULT '[]',
+  artifact_issues TEXT NOT NULL DEFAULT '[]',
   created_at TEXT NOT NULL,
   started_at TEXT NOT NULL DEFAULT '',
   finished_at TEXT NOT NULL DEFAULT '',
@@ -194,6 +196,8 @@ var migrations = []struct{ table, column, def string }{
 	{"stages", "failure_kind", "TEXT NOT NULL DEFAULT ''"},
 	{"stages", "attempt", "INTEGER NOT NULL DEFAULT 1"},
 	{"stages", "next_attempt_at", "TEXT NOT NULL DEFAULT ''"},
+	{"stages", "artifact_issues", "TEXT NOT NULL DEFAULT '[]'"},
+	{"runs", "shots", "TEXT NOT NULL DEFAULT '[]'"},
 }
 
 // 测试状态。
@@ -356,9 +360,9 @@ func (s *Store) SetSetting(ctx context.Context, k, v string) error {
 // ---- runtimes ----
 
 type Runtime struct {
-	ID        int64              `json:"id"`
-	Name      string             `json:"name"`
-	Info      *protocol.HostInfo `json:"info"`
+	ID   int64              `json:"id"`
+	Name string             `json:"name"`
+	Info *protocol.HostInfo `json:"info"`
 	// Concurrency 是用户设置的并发度；0 表示按机器规模自动取值。
 	Concurrency int        `json:"concurrency"`
 	LastSeen    *time.Time `json:"last_seen"`
