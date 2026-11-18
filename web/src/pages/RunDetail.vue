@@ -3,7 +3,7 @@ import { ref, computed, onMounted, onUnmounted } from 'vue'
 import {
   ArrowLeft, RotateCcw, Square, GitBranch, GitCommitHorizontal, Server, Clock, Coins, ExternalLink,
   Sparkles, CircleCheck, CircleX, CircleHelp, Scale, ChevronRight, TriangleAlert, FileDiff, ScrollText,
-  MessageSquare, Send, Braces, Radio, Swords, Bug, Images, Workflow, Layers, Filter,
+  MessageSquare, Send, Braces, Radio, Swords, Bug, Images, Workflow, Layers, Filter, ShieldCheck, Snowflake,
 } from 'lucide-vue-next'
 import { api } from '../api'
 import { go } from '../router'
@@ -105,6 +105,15 @@ async function rerun() {
   const r = await act(() => api.rerun(props.id))
   if (r) go('/runs/' + r.id)
 }
+const addedToBaseline = ref(false)
+async function addToBaseline() {
+  if (!run.value?.repo_id) return
+  await act(async () => {
+    await api.createCase(run.value.repo_id, run.value.id, 'normal')
+    addedToBaseline.value = true
+  })
+}
+
 async function writeBack() {
   const r = await act(() => api.writeBack(props.id))
   if (r) run.value = { ...run.value, ...r }
@@ -146,12 +155,14 @@ const legacySteps = computed(() => {
               </div>
               <div class="row">
                 <button v-if="live" class="btn sm danger" :disabled="busy" @click="cancel"><Square :size="13" /> 取消</button>
+                <button v-if="run.status === 'completed' && run.verdict === 'pass' && run.issue_key !== 'MANUAL'" class="btn sm" :disabled="busy || addedToBaseline" @click="addToBaseline"><ShieldCheck :size="13" /> {{ addedToBaseline ? '已加入基线' : '加入回归基线' }}</button>
                 <button class="btn sm" :disabled="busy" @click="rerun"><RotateCcw :size="13" /> 重新测试</button>
               </div>
             </div>
             <div class="hero-title"><span class="issue-key">{{ run.issue_key }}</span>{{ run.issue.title }}</div>
             <div class="meta-chips">
               <span class="chip"><GitBranch /> {{ run.repo_name }} · <span class="mono">{{ run.branch }}</span></span>
+              <a v-if="run.version_id" class="chip" :href="'/versions/' + run.version_id" @click.prevent="go('/versions/' + run.version_id)"><Snowflake /> 版本</a>
               <span v-if="run.commit_sha" class="chip mono" :title="run.commit_sha"><GitCommitHorizontal /> {{ run.commit_sha.slice(0, 10) }}</span>
               <span class="chip"><Server /> {{ harnessName(run.harness) }} @ {{ run.runtime_name }}</span>
               <span v-if="run.config?.red_rounds" class="chip"><Swords /> 红队 {{ harnessName(run.config.red_harness || run.harness) }}</span>

@@ -27,6 +27,9 @@ const (
 
 var harnesses = []string{"claude", "codex"}
 
+// LinearEndpoint 便于测试时替换 Linear API 地址，生产环境为空。
+var LinearEndpoint string
+
 type Config struct {
 	AdminToken string
 	WebDir     string // 前端构建产物
@@ -42,7 +45,12 @@ type Server struct {
 
 func New(cfg Config, st *store.Store) *Server {
 	s := &Server{cfg: cfg, st: st, hub: NewHub(st)}
-	s.hub.OnFinish = s.writeBack
+	s.hub.OnFinish = func(runID string) {
+		s.writeBack(runID)
+		if run, err := s.st.Run(context.Background(), runID); err == nil && run.RegressionID != "" {
+			s.regressionDone(context.Background(), run.RegressionID)
+		}
+	}
 	return s
 }
 
@@ -79,6 +87,24 @@ func (s *Server) Handler() http.Handler {
 
 	api.HandleFunc("GET /api/issues", s.searchIssues)
 	api.HandleFunc("GET /api/issues/{key}", s.previewIssue)
+
+	api.HandleFunc("GET /api/versions", s.listVersions)
+	api.HandleFunc("POST /api/versions", s.createVersion)
+	api.HandleFunc("GET /api/versions/{id}", s.getVersion)
+	api.HandleFunc("PATCH /api/versions/{id}", s.updateVersion)
+	api.HandleFunc("DELETE /api/versions/{id}", s.deleteVersion)
+	api.HandleFunc("POST /api/versions/{id}/issues", s.addVersionIssue)
+	api.HandleFunc("DELETE /api/versions/{id}/issues/{key}", s.removeVersionIssue)
+	api.HandleFunc("POST /api/versions/{id}/regressions", s.createRegression)
+	api.HandleFunc("POST /api/versions/{id}/release", s.releaseVersion)
+	api.HandleFunc("POST /api/regressions/{id}/retry", s.retryRegression)
+	api.HandleFunc("POST /api/regressions/{id}/cancel", s.cancelRegression)
+	api.HandleFunc("GET /api/repos/{id}/cases", s.listCases)
+	api.HandleFunc("POST /api/repos/{id}/cases", s.createCase)
+	api.HandleFunc("GET /api/cases/{id}", s.getCase)
+	api.HandleFunc("PATCH /api/cases/{id}", s.updateCase)
+	api.HandleFunc("DELETE /api/cases/{id}", s.deleteCase)
+	api.HandleFunc("GET /api/cases/{id}/history", s.caseHistory)
 
 	api.HandleFunc("GET /api/runs", s.listRuns)
 	api.HandleFunc("POST /api/runs", s.createRun)
@@ -153,6 +179,14 @@ func decode(r *http.Request, v any) error {
 
 func pathID(r *http.Request) (int64, error) {
 	return strconv.ParseInt(r.PathValue("id"), 10, 64)
+}
+
+func linearClient(key string) *linear.Client {
+	c := linear.New(key)
+	if LinearEndpoint != "" {
+		c.Endpoint = LinearEndpoint
+	}
+	return c
 }
 
 func (s *Server) linearKey(ctx context.Context) string {
@@ -474,7 +508,7 @@ func (s *Server) searchIssues(w http.ResponseWriter, r *http.Request) {
 		fail(w, http.StatusBadRequest, "尚未配置 Linear API Key，请先在「设置」里填写，或改用手动输入需求")
 		return
 	}
-	list, err := linear.New(key).SearchIssues(r.Context(), q, limit)
+	list, err := linearClient(key).SearchIssues(r.Context(), q, limit)
 	if err != nil {
 		fail(w, http.StatusBadGateway, err.Error())
 		return
@@ -483,7 +517,7 @@ func (s *Server) searchIssues(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) previewIssue(w http.ResponseWriter, r *http.Request) {
-	is, err := linear.New(s.linearKey(r.Context())).GetIssue(r.Context(), strings.TrimSpace(r.PathValue("key")))
+	is, err := linearClient(s.linearKey(r.Context())).GetIssue(r.Context(), strings.TrimSpace(r.PathValue("key")))
 	if err != nil {
 		fail(w, http.StatusBadGateway, err.Error())
 		return

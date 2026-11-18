@@ -75,6 +75,9 @@ type Input struct {
 	Repo         RepoInfo
 	Approved     bool
 	ApprovalNote string
+	// 回归测试：锁定的 commit，以及计划复用的来源测试（平台会预先写入计划阶段）。
+	Commit     string
+	PlanSource string
 }
 
 // 下一步动作。

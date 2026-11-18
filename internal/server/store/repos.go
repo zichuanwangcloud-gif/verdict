@@ -77,6 +77,13 @@ func (s *Store) UpdateRepo(ctx context.Context, r Repo) error {
 }
 
 func (s *Store) DeleteRepo(ctx context.Context, id int64) error {
+	var v int
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM versions WHERE repo_id=?`, id).Scan(&v); err != nil {
+		return err
+	}
+	if v > 0 {
+		return errors.New("该仓库还有版本，先删除版本")
+	}
 	var n int
 	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM runs WHERE repo_id=?`, id).Scan(&n); err != nil {
 		return err

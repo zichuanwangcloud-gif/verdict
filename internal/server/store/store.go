@@ -105,6 +105,62 @@ CREATE TABLE IF NOT EXISTS artifacts (
   content_type TEXT NOT NULL,
   created_at TEXT NOT NULL,
   PRIMARY KEY (run_id, name)
+);
+CREATE TABLE IF NOT EXISTS versions (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  repo_id INTEGER NOT NULL REFERENCES repos(id),
+  name TEXT NOT NULL,
+  status TEXT NOT NULL,
+  note TEXT NOT NULL DEFAULT '',
+  release_note TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL,
+  released_at TEXT NOT NULL DEFAULT '',
+  UNIQUE (repo_id, name)
+);
+CREATE TABLE IF NOT EXISTS version_issues (
+  version_id INTEGER NOT NULL REFERENCES versions(id) ON DELETE CASCADE,
+  repo_id INTEGER NOT NULL,
+  issue_key TEXT NOT NULL,
+  issue TEXT NOT NULL,
+  added_at TEXT NOT NULL,
+  PRIMARY KEY (version_id, issue_key),
+  UNIQUE (repo_id, issue_key)
+);
+CREATE TABLE IF NOT EXISTS regressions (
+  id TEXT PRIMARY KEY,
+  version_id INTEGER NOT NULL REFERENCES versions(id),
+  seq INTEGER NOT NULL,
+  freeze_ref TEXT NOT NULL,
+  freeze_full_ref TEXT NOT NULL DEFAULT '',
+  freeze_sha TEXT NOT NULL,
+  scope TEXT NOT NULL,
+  config TEXT NOT NULL,
+  runtime_ids TEXT NOT NULL,
+  status TEXT NOT NULL,
+  verdict TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL,
+  finished_at TEXT NOT NULL DEFAULT ''
+);
+CREATE TABLE IF NOT EXISTS cases (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  repo_id INTEGER NOT NULL REFERENCES repos(id),
+  issue_key TEXT NOT NULL,
+  issue TEXT NOT NULL,
+  plan TEXT NOT NULL DEFAULT '',
+  source_run_id TEXT NOT NULL,
+  source_version_id INTEGER NOT NULL DEFAULT 0,
+  level TEXT NOT NULL,
+  status TEXT NOT NULL,
+  retired_reason TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  UNIQUE (repo_id, issue_key)
+);
+CREATE TABLE IF NOT EXISTS case_history (
+  case_id INTEGER NOT NULL REFERENCES cases(id) ON DELETE CASCADE,
+  ts TEXT NOT NULL,
+  action TEXT NOT NULL,
+  detail TEXT NOT NULL
 );`
 
 // migrations 给旧库补列：表名 → 列定义。只增不改，旧数据原样保留。
@@ -122,6 +178,14 @@ var migrations = []struct{ table, column, def string }{
 	{"runs", "current_stage", "TEXT NOT NULL DEFAULT ''"},
 	{"runs", "awaiting_since", "TEXT NOT NULL DEFAULT ''"},
 	{"run_logs", "stage", "TEXT NOT NULL DEFAULT ''"},
+	{"runs", "version_id", "INTEGER NOT NULL DEFAULT 0"},
+	{"runs", "regression_id", "TEXT NOT NULL DEFAULT ''"},
+	{"runs", "case_id", "INTEGER NOT NULL DEFAULT 0"},
+	{"runs", "pin_ref", "TEXT NOT NULL DEFAULT ''"},
+	{"runs", "pin_sha", "TEXT NOT NULL DEFAULT ''"},
+	{"runs", "plan_source", "TEXT NOT NULL DEFAULT ''"},
+	{"runs", "preset_plan", "TEXT NOT NULL DEFAULT ''"},
+	{"runs", "attempt", "INTEGER NOT NULL DEFAULT 1"},
 }
 
 // 测试状态。
@@ -202,8 +266,16 @@ func migrate(db *sql.DB) error {
 			have[m.table][m.column] = true
 		}
 	}
-	_, err := db.Exec(`CREATE INDEX IF NOT EXISTS stages_run ON stages(run_id, seq)`)
-	return err
+	for _, q := range []string{
+		`CREATE INDEX IF NOT EXISTS stages_run ON stages(run_id, seq)`,
+		`CREATE INDEX IF NOT EXISTS runs_version ON runs(version_id)`,
+		`CREATE INDEX IF NOT EXISTS runs_regression ON runs(regression_id)`,
+	} {
+		if _, err := db.Exec(q); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (s *Store) Close() error { return s.db.Close() }

@@ -4,22 +4,24 @@ package protocol
 import "encoding/json"
 
 // Version 是 agent/server 的版本号，构建时可用 -ldflags 覆盖。
-var Version = "0.2.0-dev"
+var Version = "0.3.0-dev"
 
 // ProtocolVersion 是消息协议版本。后端只给协议版本相同的 agent 派发任务。
-const ProtocolVersion = 2
+const ProtocolVersion = 3
 
 const (
 	// agent → server
-	TypeHello = "hello"
-	TypeEvent = "event"
-	TypeProbe = "probe"
+	TypeHello    = "hello"
+	TypeEvent    = "event"
+	TypeProbe    = "probe"
+	TypeResolved = "resolved"
 	// server → agent
-	TypeStart  = "start"
-	TypeStage  = "stage"
-	TypeFinish = "finish"
-	TypeCancel = "cancel"
-	TypeSync   = "sync"
+	TypeStart   = "start"
+	TypeStage   = "stage"
+	TypeFinish  = "finish"
+	TypeCancel  = "cancel"
+	TypeSync    = "sync"
+	TypeResolve = "resolve"
 )
 
 // Envelope 只用于先读出 type，再按类型解析。
@@ -149,6 +151,26 @@ type Start struct {
 	RunID   string `json:"run_id"`
 	RepoURL string `json:"repo_url"`
 	Branch  string `json:"branch"`
+	// Ref 是完整引用名（refs/heads/x、refs/tags/x），为空时用 refs/heads/<Branch>。
+	Ref string `json:"ref,omitempty"`
+	// Commit 非空时把工作区锁定到这个 commit（回归测试的冻结节点）。
+	Commit string `json:"commit,omitempty"`
+}
+
+// Resolve 让 agent 把分支名 / tag / SHA 解析成 commit，回复 Resolved。
+type Resolve struct {
+	Type    string `json:"type"`
+	ReqID   string `json:"req_id"`
+	RepoURL string `json:"repo_url"`
+	Ref     string `json:"ref"`
+}
+
+type Resolved struct {
+	Type  string `json:"type"`
+	ReqID string `json:"req_id"`
+	Ref   string `json:"ref,omitempty"` // 匹配到的完整引用名；输入是 SHA 时为空
+	SHA   string `json:"sha,omitempty"`
+	Error string `json:"error,omitempty"`
 }
 
 // 阶段执行方式。

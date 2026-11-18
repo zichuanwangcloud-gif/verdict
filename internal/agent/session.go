@@ -26,6 +26,7 @@ func (e stageTimeoutError) Error() string { return fmt.Sprintf("阶段超过时�
 // session 是一个测试在运行时上的全部状态：工作区、托管服务、正在执行的阶段。
 type session struct {
 	runID, repoURL, branch string
+	ref, commit            string // 回归测试：完整引用名与锁定的 commit
 	ctx                    context.Context
 	cancel                 context.CancelCauseFunc
 	ready                  chan struct{} // 工作区准备结束（成功或失败）后关闭
@@ -63,7 +64,7 @@ func (a *Agent) onStart(m protocol.Start) {
 	}
 	ctx, cancel := context.WithCancelCause(context.Background())
 	tmp := a.ws.TempDir(m.RunID)
-	s := &session{runID: m.RunID, repoURL: m.RepoURL, branch: m.Branch, ctx: ctx, cancel: cancel,
+	s := &session{runID: m.RunID, repoURL: m.RepoURL, branch: m.Branch, ref: m.Ref, commit: m.Commit, ctx: ctx, cancel: cancel,
 		ready: make(chan struct{}), tmp: tmp, artifacts: filepath.Join(tmp, "artifacts")}
 	s.lifetime = time.AfterFunc(sessionLifetime, func() {
 		a.closeSession(s, protocol.ClosedResult{Error: "测试超过 48 小时没有结束，agent 自动收尾"}, false)
@@ -77,7 +78,7 @@ func (a *Agent) prepare(s *session) {
 	logf := a.logger(s.runID, "")
 	log.Printf("开始测试 %s：%s@%s", s.runID, s.repoURL, s.branch)
 	a.emit(protocol.Event{RunID: s.runID, Kind: protocol.KindAccepted})
-	prep, err := a.ws.Prepare(s.ctx, s.runID, s.repoURL, s.branch, logf)
+	prep, err := a.ws.Prepare(s.ctx, s.runID, s.repoURL, Target{Branch: s.branch, Ref: s.ref, Commit: s.commit}, logf)
 	if err == nil {
 		err = os.MkdirAll(s.artifacts, 0o755)
 	}
