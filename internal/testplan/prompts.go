@@ -182,6 +182,7 @@ func writePlanTask(b *strings.Builder, cfg Config) {
 2. 为每条选择验证方式 method：cli（命令行、单元测试）、api（对运行中的服务发请求）、ui（需要在浏览器里操作页面）、code（只能通过阅读代码判断）。能实测的不要选 code。
 3. 每条写清前置条件 preconditions、具体步骤 steps（具体到命令、接口、页面）和预期现象 expected。
 4. 判断验证是否需要把服务跑起来（needs_service），并给出 service 建议：安装依赖命令 setup_cmd、**前台运行**的启动命令 start_cmd（不要加 &、nohup，平台会托管它在后台运行）、健康检查地址 health_url、前端入口地址 app_url。仓库维护者已经提供的，以维护者的为准。用不上的字段填空字符串。
+   端口一律用占位符 ${VERDICT_PORT}（第 2、3 个端口写成 ${VERDICT_PORT2}、${VERDICT_PORT3}），**不要写死 3000 这样的端口号**：平台会同时跑多个测试，写死会互相冲突。
 5. summary 用一两句话说明测试思路。
 `)
 	if cfg.BriefPlan {

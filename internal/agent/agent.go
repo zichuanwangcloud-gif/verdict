@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -38,8 +39,10 @@ type Agent struct {
 	conn   *websocket.Conn
 	synced bool // 收到 sync 并补发完成后，事件才实时发送
 
-	sesMu sync.Mutex
-	ses   *session // 当前持有工作区的测试（同一时间最多一个）
+	sesMu    sync.Mutex
+	sessions map[string]*session // 当前持有工作区的测试，按 runID 索引
+	// maxSessions 是 agent 侧的并发上限；0 表示完全信任平台调度。
+	maxSessions int
 }
 
 func New(dir string) (*Agent, error) {
@@ -54,7 +57,8 @@ func New(dir string) (*Agent, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Agent{dir: dir, cfg: cfg, journal: j, ws: Workspace{Root: dir}, http: &http.Client{Timeout: 2 * time.Minute}}, nil
+	return &Agent{dir: dir, cfg: cfg, journal: j, ws: Workspace{Root: dir},
+		http: &http.Client{Timeout: 2 * time.Minute}, sessions: map[string]*session{}}, nil
 }
 
 // Probe 探测本机信息、harness 与浏览器。
@@ -78,8 +82,29 @@ func Probe(ctx context.Context) protocol.HostInfo {
 		}()
 	}
 	info.Browser = probeBrowser()
+	info.CPU = runtime.NumCPU()
+	info.MemTotalMB = memTotalMB()
 	wg.Wait()
 	return info
+}
+
+// memTotalMB 返回物理内存（MB），读不到时返回 0。
+func memTotalMB() int {
+	b, err := os.ReadFile("/proc/meminfo")
+	if err != nil {
+		return 0
+	}
+	for line := range strings.Lines(string(b)) {
+		if v, ok := strings.CutPrefix(line, "MemTotal:"); ok {
+			f := strings.Fields(v)
+			if len(f) > 0 {
+				if kb, err := strconv.Atoi(f[0]); err == nil {
+					return kb / 1024
+				}
+			}
+		}
+	}
+	return 0
 }
 
 // Run 常驻运行：断线自动重连，直到 ctx 结束。
@@ -94,9 +119,15 @@ func (a *Agent) Run(ctx context.Context) error {
 	go func() {
 		defer close(stopped)
 		<-ctx.Done()
-		if s := a.current(); s != nil {
-			a.closeSession(s, protocol.ClosedResult{Error: "agent 正在退出，测试中断"}, false)
+		var wg sync.WaitGroup
+		for _, s := range a.allSessions() {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				a.closeSession(s, protocol.ClosedResult{Error: "agent 正在退出，测试中断"}, false)
+			}()
 		}
+		wg.Wait()
 		connCancel()
 	}()
 
@@ -137,11 +168,7 @@ func (a *Agent) housekeeping(ctx context.Context) {
 	t := time.NewTicker(time.Hour)
 	defer t.Stop()
 	for {
-		active := ""
-		if s := a.current(); s != nil {
-			active = s.runID
-		}
-		a.ws.GC(ctx, keepFailed, active)
+		a.ws.GC(ctx, keepFailed, a.activeRunIDs())
 		a.journal.Prune(keepJournal)
 		select {
 		case <-ctx.Done():
@@ -151,17 +178,37 @@ func (a *Agent) housekeeping(ctx context.Context) {
 	}
 }
 
-func (a *Agent) current() *session {
+// allSessions 返回当前全部会话的快照。
+func (a *Agent) allSessions() []*session {
 	a.sesMu.Lock()
 	defer a.sesMu.Unlock()
-	return a.ses
+	out := make([]*session, 0, len(a.sessions))
+	for _, s := range a.sessions {
+		out = append(out, s)
+	}
+	return out
+}
+
+func (a *Agent) activeRunIDs() []string {
+	ss := a.allSessions()
+	out := make([]string, 0, len(ss))
+	for _, s := range ss {
+		out = append(out, s.runID)
+	}
+	return out
 }
 
 func (a *Agent) sessionFor(runID string) *session {
-	if s := a.current(); s != nil && s.runID == runID {
-		return s
-	}
-	return nil
+	a.sesMu.Lock()
+	defer a.sesMu.Unlock()
+	return a.sessions[runID]
+}
+
+// busy 返回正在执行的测试数。
+func (a *Agent) busy() int {
+	a.sesMu.Lock()
+	defer a.sesMu.Unlock()
+	return len(a.sessions)
 }
 
 // session 维持一次 WebSocket 连接。
@@ -195,10 +242,9 @@ func (a *Agent) session(ctx context.Context) error {
 		a.mu.Unlock()
 	}()
 
-	hello := protocol.Hello{Type: protocol.TypeHello, Host: Probe(sctx), KnownRuns: a.journal.Runs()}
-	if s := a.current(); s != nil {
-		hello.Active = s.runID
-	}
+	host := Probe(sctx)
+	host.Busy = a.busy()
+	hello := protocol.Hello{Type: protocol.TypeHello, Host: host, KnownRuns: a.journal.Runs(), Active: a.activeRunIDs()}
 	if err := a.write(sctx, conn, hello); err != nil {
 		return err
 	}
@@ -283,20 +329,27 @@ func (a *Agent) handle(ctx context.Context, conn *websocket.Conn, data []byte) e
 			}
 		}()
 	case protocol.TypeProbe:
-		go func() {
-			info := Probe(ctx)
-			a.mu.Lock()
-			defer a.mu.Unlock()
-			if a.conn == conn {
-				if err := a.write(ctx, conn, protocol.Probe{Type: protocol.TypeProbe, Host: info}); err != nil {
-					conn.CloseNow()
-				}
-			}
-		}()
+		go a.probeNow()
+		return nil
 	default:
 		return errors.New("未知消息类型: " + env.Type)
 	}
 	return nil
+}
+
+// probeNow 立即探测并上报一次（并发度变化后也会调用）。
+func (a *Agent) probeNow() {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	info := Probe(ctx)
+	info.Busy, info.Concurrency = a.busy(), a.concurrency()
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.conn != nil {
+		if err := a.write(ctx, a.conn, protocol.Probe{Type: protocol.TypeProbe, Host: info}); err != nil {
+			a.conn.CloseNow()
+		}
+	}
 }
 
 // onSync 补发后端尚未收到的事件，之后切换到实时发送。

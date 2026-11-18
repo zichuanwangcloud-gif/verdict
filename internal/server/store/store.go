@@ -186,6 +186,9 @@ var migrations = []struct{ table, column, def string }{
 	{"runs", "plan_source", "TEXT NOT NULL DEFAULT ''"},
 	{"runs", "preset_plan", "TEXT NOT NULL DEFAULT ''"},
 	{"runs", "attempt", "INTEGER NOT NULL DEFAULT 1"},
+	{"runs", "ports", "TEXT NOT NULL DEFAULT '[]'"},
+	{"runtimes", "concurrency", "INTEGER NOT NULL DEFAULT 0"},
+	{"repos", "ports", "INTEGER NOT NULL DEFAULT 1"},
 }
 
 // 测试状态。
@@ -350,9 +353,11 @@ type Runtime struct {
 	ID        int64              `json:"id"`
 	Name      string             `json:"name"`
 	Info      *protocol.HostInfo `json:"info"`
-	LastSeen  *time.Time         `json:"last_seen"`
-	CreatedAt *time.Time         `json:"created_at"`
-	Online    bool               `json:"online"` // 由 hub 填充
+	// Concurrency 是用户设置的并发度；0 表示按机器规模自动取值。
+	Concurrency int        `json:"concurrency"`
+	LastSeen    *time.Time `json:"last_seen"`
+	CreatedAt   *time.Time `json:"created_at"`
+	Online      bool       `json:"online"` // 由 hub 填充
 }
 
 // CreateRuntime 返回运行时与明文令牌（只此一次）。
@@ -367,12 +372,12 @@ func (s *Store) CreateRuntime(ctx context.Context, name string) (Runtime, string
 	return rt, token, err
 }
 
-const runtimeCols = `id, name, info, last_seen, created_at`
+const runtimeCols = `id, name, info, concurrency, last_seen, created_at`
 
 func scanRuntime(sc interface{ Scan(...any) error }) (Runtime, error) {
 	var rt Runtime
 	var info, seen, created string
-	if err := sc.Scan(&rt.ID, &rt.Name, &info, &seen, &created); err != nil {
+	if err := sc.Scan(&rt.ID, &rt.Name, &info, &rt.Concurrency, &seen, &created); err != nil {
 		return rt, err
 	}
 	_ = json.Unmarshal([]byte(info), &rt.Info)
@@ -422,6 +427,18 @@ func (s *Store) UpdateRuntimeInfo(ctx context.Context, id int64, info protocol.H
 func (s *Store) TouchRuntime(ctx context.Context, id int64) error {
 	_, err := s.db.ExecContext(ctx, `UPDATE runtimes SET last_seen=? WHERE id=?`, now(), id)
 	return err
+}
+
+// SetConcurrency 设置并发度；0 表示跟随按机器算出的建议值。
+func (s *Store) SetConcurrency(ctx context.Context, id int64, n int) error {
+	res, err := s.db.ExecContext(ctx, `UPDATE runtimes SET concurrency=? WHERE id=?`, n, id)
+	if err != nil {
+		return err
+	}
+	if c, _ := res.RowsAffected(); c == 0 {
+		return ErrNotFound
+	}
+	return nil
 }
 
 func (s *Store) RenameRuntime(ctx context.Context, id int64, name string) error {

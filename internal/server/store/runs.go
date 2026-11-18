@@ -17,6 +17,7 @@ type Run struct {
 	RepoID           int64               `json:"repo_id"`
 	RepoURL          string              `json:"repo_url"`
 	RepoName         string              `json:"repo_name"`
+	RepoPorts        int                 `json:"repo_ports"` // 这个仓库需要的端口数（并发时由 agent 分配）
 	Branch           string              `json:"branch"`
 	CommitSHA        string              `json:"commit_sha"`
 	IssueKey         string              `json:"issue_key"`
@@ -52,28 +53,29 @@ type Run struct {
 	PinSHA           string              `json:"pin_sha"`
 	PlanSource       string              `json:"plan_source"`
 	PresetPlan       string              `json:"-"`
+	Ports            []int               `json:"ports"`
 	Attempt          int                 `json:"attempt"`
 	CreatedAt        *time.Time          `json:"created_at"`
 	StartedAt        *time.Time          `json:"started_at"`
 	FinishedAt       *time.Time          `json:"finished_at"`
 }
 
-const runCols = `r.id, r.repo_id, p.url, p.name, r.branch, r.commit_sha, r.issue_key, r.issue, r.runtime_id, t.name,
+const runCols = `r.id, r.repo_id, p.url, p.name, p.ports, r.branch, r.commit_sha, r.issue_key, r.issue, r.runtime_id, t.name,
  r.harness, r.tier, r.config, r.timeout_minutes, r.status, r.current_stage, r.verdict, r.summary, r.acs, r.findings, r.pages,
  r.approved, r.approval_note, r.awaiting_since, r.source_modified, r.diff, r.prompt, r.raw, r.cost_usd, r.error,
  r.linear_comment_url, r.linear_error, r.version_id, r.regression_id, r.case_id, r.pin_ref, r.pin_sha, r.plan_source,
- r.preset_plan, r.attempt, r.created_at, r.started_at, r.finished_at
+ r.preset_plan, r.ports, r.attempt, r.created_at, r.started_at, r.finished_at
  FROM runs r JOIN repos p ON p.id=r.repo_id JOIN runtimes t ON t.id=r.runtime_id`
 
 func scanRun(sc interface{ Scan(...any) error }) (Run, error) {
 	var r Run
-	var issue, cfg, acs, findings, pages, awaiting, created, started, finished string
+	var issue, cfg, acs, findings, pages, awaiting, ports, created, started, finished string
 	var modified, approved int
-	err := sc.Scan(&r.ID, &r.RepoID, &r.RepoURL, &r.RepoName, &r.Branch, &r.CommitSHA, &r.IssueKey, &issue, &r.RuntimeID,
+	err := sc.Scan(&r.ID, &r.RepoID, &r.RepoURL, &r.RepoName, &r.RepoPorts, &r.Branch, &r.CommitSHA, &r.IssueKey, &issue, &r.RuntimeID,
 		&r.RuntimeName, &r.Harness, &r.Tier, &cfg, &r.TimeoutMinutes, &r.Status, &r.CurrentStage, &r.Verdict, &r.Summary,
 		&acs, &findings, &pages, &approved, &r.ApprovalNote, &awaiting, &modified, &r.Diff, &r.Prompt, &r.Raw, &r.CostUSD,
 		&r.Error, &r.LinearCommentURL, &r.LinearError, &r.VersionID, &r.RegressionID, &r.CaseID, &r.PinRef, &r.PinSHA,
-		&r.PlanSource, &r.PresetPlan, &r.Attempt, &created, &started, &finished)
+		&r.PlanSource, &r.PresetPlan, &ports, &r.Attempt, &created, &started, &finished)
 	if err != nil {
 		return r, err
 	}
@@ -90,6 +92,10 @@ func scanRun(sc interface{ Scan(...any) error }) (Run, error) {
 	}
 	if r.Pages == nil {
 		r.Pages = []testplan.UIPage{}
+	}
+	_ = json.Unmarshal([]byte(ports), &r.Ports)
+	if r.Ports == nil {
+		r.Ports = []int{}
 	}
 	r.SourceModified, r.Approved = modified != 0, approved != 0
 	r.AwaitingSince = parseTime(awaiting)
@@ -241,6 +247,11 @@ func (s *Store) SetStatus(ctx context.Context, id, to, errMsg string, from ...st
 	}
 	n, _ := res.RowsAffected()
 	return n > 0, nil
+}
+
+func (s *Store) SetPorts(ctx context.Context, id string, ports []int) error {
+	_, err := s.db.ExecContext(ctx, `UPDATE runs SET ports=? WHERE id=?`, toJSON(ports), id)
+	return err
 }
 
 func (s *Store) SetCommit(ctx context.Context, id, sha string) error {

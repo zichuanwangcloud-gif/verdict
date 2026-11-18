@@ -27,6 +27,8 @@ func (e stageTimeoutError) Error() string { return fmt.Sprintf("阶段超过时�
 type session struct {
 	runID, repoURL, branch string
 	ref, commit            string // 回归测试：完整引用名与锁定的 commit
+	portCount              int    // 需要分配的端口数
+	ports                  []int  // agent 实际分配到的端口
 	ctx                    context.Context
 	cancel                 context.CancelCauseFunc
 	ready                  chan struct{} // 工作区准备结束（成功或失败）后关闭
@@ -45,33 +47,66 @@ type session struct {
 }
 
 func (s *session) env() []string {
-	return []string{"VERDICT_RUN_ID=" + s.runID, "COMPOSE_PROJECT_NAME=verdict-" + s.runID, "VERDICT_ARTIFACTS=" + s.artifacts}
+	out := []string{"VERDICT_RUN_ID=" + s.runID, "COMPOSE_PROJECT_NAME=verdict-" + s.runID, "VERDICT_ARTIFACTS=" + s.artifacts}
+	if len(s.ports) > 0 {
+		out = append(out, fmt.Sprintf("VERDICT_PORT=%d", s.ports[0]), fmt.Sprintf("VERDICT_PORT_COUNT=%d", len(s.ports)))
+		for i, p := range s.ports {
+			out = append(out, fmt.Sprintf("VERDICT_PORT%d=%d", i+1, p))
+		}
+	}
+	return out
 }
 
 func (a *Agent) onStart(m protocol.Start) {
 	a.sesMu.Lock()
-	if a.ses != nil {
-		busy := a.ses.runID
+	if _, running := a.sessions[m.RunID]; running {
 		a.sesMu.Unlock()
-		if busy != m.RunID {
-			a.emit(protocol.Event{RunID: m.RunID, Kind: protocol.KindClosed, Closed: &protocol.ClosedResult{Error: "运行时正忙（正在执行 " + busy + "）"}})
-		}
-		return
+		return // 重复派发
 	}
 	if a.journal.Closed(m.RunID) {
 		a.sesMu.Unlock()
 		return // 已经结束过，结果会通过 sync 补发
 	}
+	// 并发上限由平台决定（平台不会派超过并发的任务）；这里只做一层保护，
+	// 超过时告诉平台重新排队，而不是判失败。
+	if limit := a.concurrency(); limit > 0 && len(a.sessions) >= limit {
+		a.sesMu.Unlock()
+		a.emit(protocol.Event{RunID: m.RunID, Kind: protocol.KindClosed,
+			Closed: &protocol.ClosedResult{Busy: true, Error: "运行时并发已满"}})
+		return
+	}
+	ports, err := freePorts(m.Ports)
+	if err != nil {
+		a.sesMu.Lock()
+		delete(a.sessions, m.RunID)
+		a.sesMu.Unlock()
+		a.emit(protocol.Event{RunID: m.RunID, Kind: protocol.KindClosed, Closed: &protocol.ClosedResult{Error: "分配端口失败: " + err.Error()}})
+		return
+	}
 	ctx, cancel := context.WithCancelCause(context.Background())
 	tmp := a.ws.TempDir(m.RunID)
-	s := &session{runID: m.RunID, repoURL: m.RepoURL, branch: m.Branch, ref: m.Ref, commit: m.Commit, ctx: ctx, cancel: cancel,
-		ready: make(chan struct{}), tmp: tmp, artifacts: filepath.Join(tmp, "artifacts")}
+	s := &session{ports: ports, runID: m.RunID, repoURL: m.RepoURL, branch: m.Branch, ref: m.Ref, commit: m.Commit, portCount: m.Ports,
+		ctx: ctx, cancel: cancel, ready: make(chan struct{}), tmp: tmp, artifacts: filepath.Join(tmp, "artifacts")}
 	s.lifetime = time.AfterFunc(sessionLifetime, func() {
 		a.closeSession(s, protocol.ClosedResult{Error: "测试超过 48 小时没有结束，agent 自动收尾"}, false)
 	})
-	a.ses = s
+	a.sessions[m.RunID] = s
 	a.sesMu.Unlock()
+	a.probeLater()
 	go a.prepare(s)
+}
+
+// concurrency 是 agent 自己的并发上限；0 表示完全信任平台调度。
+func (a *Agent) concurrency() int {
+	return a.maxSessions
+}
+
+// probeLater 在会话数变化后补报一次探测，让平台知道实际忙碌程度。
+func (a *Agent) probeLater() {
+	go func() {
+		time.Sleep(200 * time.Millisecond)
+		a.probeNow()
+	}()
 }
 
 func (a *Agent) prepare(s *session) {
@@ -94,7 +129,7 @@ func (a *Agent) prepare(s *session) {
 		go a.closeSession(s, protocol.ClosedResult{Error: "准备工作区失败: " + err.Error()}, true)
 		return
 	}
-	a.emit(protocol.Event{RunID: s.runID, Kind: protocol.KindReady, Commit: prep.Commit})
+	a.emit(protocol.Event{RunID: s.runID, Kind: protocol.KindReady, Commit: prep.Commit, Ports: s.ports})
 }
 
 func (a *Agent) onStage(m protocol.Stage) {
@@ -304,8 +339,9 @@ func (a *Agent) closeSession(s *session, res protocol.ClosedResult, keepWorktree
 	log.Printf("测试 %s 已收尾（取消=%v 错误=%s）", s.runID, res.Canceled, res.Error)
 
 	a.sesMu.Lock()
-	if a.ses == s {
-		a.ses = nil
+	if a.sessions[s.runID] == s {
+		delete(a.sessions, s.runID)
 	}
 	a.sesMu.Unlock()
+	a.probeLater()
 }

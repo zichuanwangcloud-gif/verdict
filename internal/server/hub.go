@@ -199,7 +199,13 @@ func (h *Hub) handle(ctx context.Context, c *agentConn, data []byte) error {
 		if err := json.Unmarshal(data, &m); err != nil {
 			return err
 		}
-		return h.st.UpdateRuntimeInfo(ctx, c.runtimeID, m.Host)
+		if err := h.st.UpdateRuntimeInfo(ctx, c.runtimeID, m.Host); err != nil {
+			return err
+		}
+		// agent 上报的 busy 是判断有没有空槽位的依据之一，变化后要立刻重新调度，
+		// 否则它空闲下来后只能等看门狗。
+		go h.Schedule(c.runtimeID)
+		return nil
 	case protocol.TypeEvent:
 		if !c.compatible {
 			return nil
@@ -253,8 +259,8 @@ func (h *Hub) onHello(ctx context.Context, c *agentConn, m protocol.Hello) error
 		return err
 	}
 	// agent 仍持有工作区、但平台上已结束（例如离线期间被取消）的测试，通知它收尾。
-	if m.Active != "" {
-		if r, err := h.st.Run(ctx, m.Active); err == nil && store.Terminal(r.Status) {
+	for _, id := range m.Active {
+		if r, err := h.st.Run(ctx, id); err == nil && store.Terminal(r.Status) {
 			_ = c.send(ctx, protocol.Cancel{Type: protocol.TypeCancel, RunID: r.ID})
 		}
 	}
@@ -286,6 +292,9 @@ func (h *Hub) onEvent(ctx context.Context, c *agentConn, ev protocol.Event) erro
 	case protocol.KindAccepted:
 		_, err = h.st.SetStatus(ctx, run.ID, store.StatusPreparing, "", store.StatusDispatched, store.StatusQueued)
 	case protocol.KindReady:
+		if len(ev.Ports) > 0 {
+			_ = h.st.SetPorts(ctx, run.ID, ev.Ports)
+		}
 		if err = h.st.SetCommit(ctx, run.ID, ev.Commit); err == nil {
 			_, err = h.st.SetStatus(ctx, run.ID, store.StatusRunning, "", store.StatusDispatched, store.StatusQueued, store.StatusPreparing)
 			advance = true
@@ -323,6 +332,13 @@ func (h *Hub) onEvent(ctx context.Context, c *agentConn, ev protocol.Event) erro
 }
 
 func (h *Hub) onClosed(ctx context.Context, run store.Run, c protocol.ClosedResult) {
+	if c.Busy && !c.Canceled {
+		// 运行时并发已满，测试根本没开始：放回队列，不判失败。
+		if _, err := h.st.SetStatus(ctx, run.ID, store.StatusQueued, "", run.Status, store.StatusDispatched, store.StatusPreparing); err == nil {
+			log.Printf("测试 %s 因运行时并发已满重新排队", run.ID)
+		}
+		return
+	}
 	status, msg := store.StatusCompleted, ""
 	switch {
 	case c.Canceled:
@@ -412,7 +428,8 @@ func (h *Hub) OnlineIDs() []int64 {
 	return out
 }
 
-// Schedule 在运行时在线、版本兼容且空闲时，派发最早排队的测试。
+// Schedule 在运行时在线、版本兼容且还有空闲槽位时，派发排队的测试。
+// 并发度取用户设置（0 时按机器规模算），并与 agent 上报的实际忙碌数取小。
 func (h *Hub) Schedule(runtimeID int64) {
 	h.schedMu.Lock()
 	defer h.schedMu.Unlock()
@@ -421,30 +438,67 @@ func (h *Hub) Schedule(runtimeID int64) {
 		return
 	}
 	ctx := context.Background()
-	busy, err := h.st.RunsOnRuntime(ctx, runtimeID, store.ActiveStatuses...)
-	if err != nil || len(busy) > 0 {
+	rt, err := h.st.Runtime(ctx, runtimeID)
+	if err != nil {
 		return
 	}
-	queued, err := h.st.RunsOnRuntime(ctx, runtimeID, store.StatusQueued)
-	if err != nil || len(queued) == 0 {
-		// 自己的队列空了，看看有没有别的运行时名下的回归子测试可以领。
-		queued = h.claimable(ctx, runtimeID)
-		if len(queued) == 0 {
+	limit := effectiveConcurrency(rt)
+	if info := rt.Info; info != nil && info.Busy > 0 && info.Busy >= limit {
+		return // agent 自己报告已经满了，等它空闲下来再派
+	}
+	busy, err := h.st.RunsOnRuntime(ctx, runtimeID, store.ActiveStatuses...)
+	if err != nil {
+		return
+	}
+	for len(busy) < limit {
+		r, ok := h.nextRun(ctx, runtimeID)
+		if !ok {
+			return
+		}
+		if ok, err := h.st.SetStatus(ctx, r.ID, store.StatusDispatched, "", store.StatusQueued); err != nil || !ok {
+			return
+		}
+		msg := protocol.Start{Type: protocol.TypeStart, RunID: r.ID, RepoURL: r.RepoURL, Branch: r.Branch,
+			Ref: r.PinRef, Commit: r.PinSHA, Ports: r.RepoPorts}
+		if err := c.send(ctx, msg); err != nil {
+			log.Printf("下发测试 %s 失败: %v", r.ID, err)
+			_, _ = h.st.SetStatus(ctx, r.ID, store.StatusQueued, "", store.StatusDispatched)
+			return
+		}
+		log.Printf("测试 %s 已下发到运行时 #%d（占用 %d/%d 个槽位）", r.ID, runtimeID, len(busy)+1, limit)
+		if r, err := h.st.Run(ctx, r.ID); err == nil {
+			busy = append(busy, r)
+		} else {
 			return
 		}
 	}
-	r := queued[0]
-	ok, err := h.st.SetStatus(ctx, r.ID, store.StatusDispatched, "", store.StatusQueued)
-	if err != nil || !ok {
-		return
+}
+
+// nextRun 取下一条要派发的测试：先自己队列里的，再领别的运行时名下的回归子测试。
+// 普通测试优先于回归子测试，避免回归把日常测试堵住。
+func (h *Hub) nextRun(ctx context.Context, runtimeID int64) (store.Run, bool) {
+	queued, err := h.st.RunsOnRuntime(ctx, runtimeID, store.StatusQueued)
+	if err != nil {
+		return store.Run{}, false
 	}
-	msg := protocol.Start{Type: protocol.TypeStart, RunID: r.ID, RepoURL: r.RepoURL, Branch: r.Branch, Ref: r.PinRef, Commit: r.PinSHA}
-	if err := c.send(ctx, msg); err != nil {
-		log.Printf("下发测试 %s 失败: %v", r.ID, err)
-		_, _ = h.st.SetStatus(ctx, r.ID, store.StatusQueued, "", store.StatusDispatched)
-		return
+	for _, r := range queued {
+		if r.RegressionID == "" {
+			return r, true
+		}
 	}
-	log.Printf("测试 %s 已下发到运行时 #%d", r.ID, runtimeID)
+	if len(queued) > 0 {
+		return queued[0], true
+	}
+	claimed := h.claimable(ctx, runtimeID)
+	for _, r := range claimed {
+		if r.RegressionID == "" {
+			return r, true
+		}
+	}
+	if len(claimed) > 0 {
+		return claimed[0], true
+	}
+	return store.Run{}, false
 }
 
 // RequestProbe 让在线的运行时重新探测 harness。

@@ -4,10 +4,10 @@ package protocol
 import "encoding/json"
 
 // Version 是 agent/server 的版本号，构建时可用 -ldflags 覆盖。
-var Version = "0.3.0-dev"
+var Version = "0.4.0-dev"
 
 // ProtocolVersion 是消息协议版本。后端只给协议版本相同的 agent 派发任务。
-const ProtocolVersion = 3
+const ProtocolVersion = 4
 
 const (
 	// agent → server
@@ -56,6 +56,10 @@ type HostInfo struct {
 	Docker       string        `json:"docker,omitempty"`
 	Harnesses    []HarnessInfo `json:"harnesses"`
 	Browser      BrowserInfo   `json:"browser"`
+	CPU          int           `json:"cpu,omitempty"`          // 逻辑核数
+	MemTotalMB   int           `json:"mem_total_mb,omitempty"` // 物理内存
+	Concurrency  int           `json:"concurrency"`            // agent 侧并发上限（0 表示信任平台调度）
+	Busy         int           `json:"busy"`                   // 正在执行的测试数
 }
 
 // Harness 返回指定 harness 的探测结果。
@@ -76,8 +80,8 @@ type Hello struct {
 	Host HostInfo `json:"host"`
 	// KnownRuns 是 agent 本地事件日志里有记录的测试。
 	KnownRuns []string `json:"known_runs"`
-	// Active 是 agent 当前持有工作区的测试（空表示空闲）。
-	Active string `json:"active,omitempty"`
+	// Active 是 agent 当前持有工作区的全部测试（空表示空闲）。
+	Active []string `json:"active,omitempty"`
 }
 
 type Probe struct {
@@ -106,6 +110,8 @@ type Event struct {
 	Text    string        `json:"text,omitempty"`
 	Stage   *StageResult  `json:"stage,omitempty"`
 	Closed  *ClosedResult `json:"closed,omitempty"`
+	// Ports 随 ready 事件回传，是 agent 为这次测试分配到的端口。
+	Ports []int `json:"ports,omitempty"`
 }
 
 // 阶段结果状态。
@@ -140,6 +146,8 @@ type ServiceStatus struct {
 type ClosedResult struct {
 	Canceled       bool   `json:"canceled,omitempty"`
 	Error          string `json:"error,omitempty"`
+	// Busy 表示运行时并发已满、这个测试根本没有开始；平台应放回队列而不是判失败。
+	Busy bool `json:"busy,omitempty"`
 	SourceModified bool   `json:"source_modified"`
 	Diff           string `json:"diff,omitempty"`
 }
@@ -155,6 +163,8 @@ type Start struct {
 	Ref string `json:"ref,omitempty"`
 	// Commit 非空时把工作区锁定到这个 commit（回归测试的冻结节点）。
 	Commit string `json:"commit,omitempty"`
+	// Ports 是这次测试需要分配的端口数；由 agent 在本机选空闲端口。
+	Ports int `json:"ports,omitempty"`
 }
 
 // Resolve 让 agent 把分支名 / tag / SHA 解析成 commit，回复 Resolved。

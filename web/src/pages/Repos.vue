@@ -6,7 +6,7 @@ import { api } from '../api'
 const list = ref([])
 const err = ref('')
 const adding = ref(false)
-const blank = () => ({ url: '', name: '', test_notes: '', setup_cmd: '', start_cmd: '', health_url: '', app_url: '' })
+const blank = () => ({ url: '', name: '', test_notes: '', setup_cmd: '', start_cmd: '', health_url: '', app_url: '', ports: 1 })
 const form = ref(blank())
 const editing = ref(null)
 
@@ -102,18 +102,22 @@ const notesPlaceholder = '交给 agent 的测试说明：\n- 怎么安装依赖�
         </div>
         <div class="field">
           <label>启动命令（前台运行）</label>
-          <input v-model="form.start_cmd" class="mono" placeholder="pnpm dev --port 3000" />
+          <input v-model="form.start_cmd" class="mono" placeholder="pnpm dev --port ${VERDICT_PORT}" />
         </div>
         <div class="field">
           <label>健康检查地址</label>
-          <input v-model="form.health_url" class="mono" placeholder="http://127.0.0.1:3000/health" />
+          <input v-model="form.health_url" class="mono" placeholder="http://127.0.0.1:${VERDICT_PORT}/health" />
         </div>
         <div class="field">
           <label>前端入口地址（UI 走查）</label>
-          <input v-model="form.app_url" class="mono" placeholder="http://127.0.0.1:3000" />
+          <input v-model="form.app_url" class="mono" placeholder="http://127.0.0.1:${VERDICT_PORT}" />
+        </div>
+        <div class="field">
+          <label>需要的端口数</label>
+          <input v-model.number="form.ports" type="number" min="0" max="8" />
         </div>
       </div>
-      <span class="hint">留空时由计划阶段的 agent 根据代码推断。启动命令不要加 &amp; 或 nohup。</span>
+      <span class="hint">留空时由计划阶段的 agent 根据代码推断。启动命令不要加 &amp; 或 nohup。端口用 <code>${VERDICT_PORT}</code> 占位，平台会为每个测试分配独立端口，并发时不会互相冲突。</span>
       <div class="field">
         <label>测试说明</label>
         <textarea v-model="form.test_notes" rows="6" :placeholder="notesPlaceholder" />
@@ -143,18 +147,22 @@ const notesPlaceholder = '交给 agent 的测试说明：\n- 怎么安装依赖�
         </div>
         <div class="field">
           <label>启动命令（前台运行）</label>
-          <input v-model="editing.start_cmd" class="mono" placeholder="pnpm dev --port 3000" />
+          <input v-model="editing.start_cmd" class="mono" placeholder="pnpm dev --port ${VERDICT_PORT}" />
         </div>
         <div class="field">
           <label>健康检查地址</label>
-          <input v-model="editing.health_url" class="mono" placeholder="http://127.0.0.1:3000/health" />
+          <input v-model="editing.health_url" class="mono" placeholder="http://127.0.0.1:${VERDICT_PORT}/health" />
         </div>
         <div class="field">
           <label>前端入口地址（UI 走查）</label>
-          <input v-model="editing.app_url" class="mono" placeholder="http://127.0.0.1:3000" />
+          <input v-model="editing.app_url" class="mono" placeholder="http://127.0.0.1:${VERDICT_PORT}" />
+        </div>
+        <div class="field">
+          <label>需要的端口数</label>
+          <input v-model.number="editing.ports" type="number" min="0" max="8" />
         </div>
       </div>
-      <span class="hint">留空时由计划阶段的 agent 根据代码推断。启动命令不要加 &amp; 或 nohup。</span>
+      <span class="hint">留空时由计划阶段的 agent 根据代码推断。启动命令不要加 &amp; 或 nohup。端口用 <code>${VERDICT_PORT}</code> 占位，平台会为每个测试分配独立端口，并发时不会互相冲突。</span>
         <div class="field"><label>测试说明</label><textarea v-model="editing.test_notes" rows="8" :placeholder="notesPlaceholder" /></div>
         <div class="row">
           <button class="btn primary" @click="save">保存</button>
@@ -180,6 +188,7 @@ const notesPlaceholder = '交给 agent 的测试说明：\n- 怎么安装依赖�
           <span v-if="r.start_cmd" class="chip"><Rocket /> <span class="mono">{{ r.start_cmd }}</span></span>
           <span v-if="r.health_url" class="chip"><HeartPulse /> <span class="mono">{{ r.health_url }}</span></span>
           <span v-if="r.app_url" class="chip"><Globe /> <span class="mono">{{ r.app_url }}</span></span>
+          <span class="chip">{{ r.ports }} 个端口</span>
         </div>
         <div>
           <div class="label row" style="gap: 6px; margin-bottom: 6px"><NotebookPen :size="12" /> 测试说明</div>
