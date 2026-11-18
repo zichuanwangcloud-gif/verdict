@@ -7,17 +7,23 @@ import (
 	"strings"
 	"time"
 
-	"verdict/internal/linear"
 	"verdict/internal/protocol"
 	"verdict/internal/server/store"
 	"verdict/internal/testplan"
 )
 
-func (s *Server) writeBack(runID string) {
+func (s *Server) writeBack(runID string) { s.writeBackForce(runID, false) }
+
+// writeBackForce 由用户手动触发时 (force=true) 即使回归子测试也回写。
+func (s *Server) writeBackForce(runID string, force bool) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
 	run, err := s.st.Run(ctx, runID)
 	if err != nil || run.Issue.ID == "" || run.Status == store.StatusCanceled {
+		return
+	}
+	if run.RegressionID != "" && !force {
+		// 回归子测试默认不回写，避免同一批 issue 反复被评论刷屏。
 		return
 	}
 	key := s.linearKey(ctx)
@@ -26,7 +32,7 @@ func (s *Server) writeBack(runID string) {
 		return
 	}
 	stages, _ := s.st.Stages(ctx, runID)
-	url, err := linear.New(key).CreateComment(ctx, run.Issue.ID, CommentBody(run, stages, s.publicURL(ctx, nil)))
+	url, err := linearClient(key).CreateComment(ctx, run.Issue.ID, CommentBody(run, stages, s.publicURL(ctx, nil)))
 	msg := ""
 	if err != nil {
 		msg = err.Error()

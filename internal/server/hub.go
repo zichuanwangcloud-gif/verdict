@@ -55,10 +55,14 @@ type Hub struct {
 	schedMu sync.Mutex
 	// advMu 串行化测试推进，避免同一个测试被重复创建阶段。
 	advMu sync.Mutex
+
+	// 等待 agent 解析冻结节点的请求。
+	resolveMu sync.Mutex
+	resolves  map[string]chan protocol.Resolved
 }
 
 func NewHub(st *store.Store) *Hub {
-	return &Hub{st: st, conns: map[int64]*agentConn{}}
+	return &Hub{st: st, conns: map[int64]*agentConn{}, resolves: map[string]chan protocol.Resolved{}}
 }
 
 func (h *Hub) Online(runtimeID int64) bool {
@@ -177,6 +181,19 @@ func (h *Hub) handle(ctx context.Context, c *agentConn, data []byte) error {
 			return err
 		}
 		return h.onHello(ctx, c, m)
+	case protocol.TypeResolved:
+		var m protocol.Resolved
+		if err := json.Unmarshal(data, &m); err != nil {
+			return err
+		}
+		h.resolveMu.Lock()
+		ch := h.resolves[m.ReqID]
+		delete(h.resolves, m.ReqID)
+		h.resolveMu.Unlock()
+		if ch != nil {
+			ch <- m
+		}
+		return nil
 	case protocol.TypeProbe:
 		var m protocol.Probe
 		if err := json.Unmarshal(data, &m); err != nil {
@@ -337,6 +354,64 @@ func (h *Hub) closeRun(ctx context.Context, runID, status, msg string, c protoco
 	}
 }
 
+// Resolve 让一个在线的运行时把分支 / tag / SHA 解析成 commit。
+// runtimeID 指定优先使用的运行时，0 表示任选一个在线的；prefer 是用它解析失败后继续尝试的候选。
+func (h *Hub) Resolve(ctx context.Context, repoURL, ref string, candidates []int64) (protocol.Resolved, int64, error) {
+	reqID := store.RandomHex(8)
+	ch := make(chan protocol.Resolved, 1)
+	h.resolveMu.Lock()
+	h.resolves[reqID] = ch
+	h.resolveMu.Unlock()
+	defer func() {
+		h.resolveMu.Lock()
+		delete(h.resolves, reqID)
+		h.resolveMu.Unlock()
+	}()
+	msg := protocol.Resolve{Type: protocol.TypeResolve, ReqID: reqID, RepoURL: repoURL, Ref: ref}
+	var lastErr error
+	for _, id := range candidates {
+		c := h.usable(id)
+		if c == nil {
+			continue
+		}
+		h.schedMu.Lock() // 与派单串行，避免同时往同一连接写大消息互相等待
+		err := c.send(ctx, msg)
+		h.schedMu.Unlock()
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		select {
+		case res := <-ch:
+			if res.Error != "" {
+				lastErr = errors.New(res.Error)
+				continue
+			}
+			return res, id, nil
+		case <-ctx.Done():
+			return protocol.Resolved{}, 0, errors.New("等待运行时解析超时")
+		}
+	}
+	if lastErr == nil {
+		lastErr = errors.New("没有在线的运行时可以解析冻结节点")
+	}
+	return protocol.Resolved{}, 0, lastErr
+}
+
+// OnlineIDs 返回在线的运行时。
+func (h *Hub) OnlineIDs() []int64 {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	out := make([]int64, 0, len(h.conns))
+	for id, c := range h.conns {
+		if c.compatible {
+			out = append(out, id)
+		}
+	}
+	slices.Sort(out)
+	return out
+}
+
 // Schedule 在运行时在线、版本兼容且空闲时，派发最早排队的测试。
 func (h *Hub) Schedule(runtimeID int64) {
 	h.schedMu.Lock()
@@ -352,14 +427,18 @@ func (h *Hub) Schedule(runtimeID int64) {
 	}
 	queued, err := h.st.RunsOnRuntime(ctx, runtimeID, store.StatusQueued)
 	if err != nil || len(queued) == 0 {
-		return
+		// 自己的队列空了，看看有没有别的运行时名下的回归子测试可以领。
+		queued = h.claimable(ctx, runtimeID)
+		if len(queued) == 0 {
+			return
+		}
 	}
 	r := queued[0]
 	ok, err := h.st.SetStatus(ctx, r.ID, store.StatusDispatched, "", store.StatusQueued)
 	if err != nil || !ok {
 		return
 	}
-	msg := protocol.Start{Type: protocol.TypeStart, RunID: r.ID, RepoURL: r.RepoURL, Branch: r.Branch}
+	msg := protocol.Start{Type: protocol.TypeStart, RunID: r.ID, RepoURL: r.RepoURL, Branch: r.Branch, Ref: r.PinRef, Commit: r.PinSHA}
 	if err := c.send(ctx, msg); err != nil {
 		log.Printf("下发测试 %s 失败: %v", r.ID, err)
 		_, _ = h.st.SetStatus(ctx, r.ID, store.StatusQueued, "", store.StatusDispatched)
@@ -375,4 +454,34 @@ func (h *Hub) RequestProbe(ctx context.Context, runtimeID int64) error {
 		return errors.New("运行时不在线")
 	}
 	return c.send(ctx, protocol.Probe{Type: protocol.TypeProbe})
+}
+
+// claimable 把这个运行时能接手的回归子测试改派到自己名下，返回可派发的测试。
+// 这样回归能分摊到多个运行时，先空闲的机器多跑。
+func (h *Hub) claimable(ctx context.Context, runtimeID int64) []store.Run {
+	gs, err := h.st.RunningRegressionsFor(ctx, runtimeID)
+	if err != nil {
+		return nil
+	}
+	var out []store.Run
+	for _, g := range gs {
+		briefs, err := h.st.QueuedRegressionRuns(ctx, g.ID)
+		if err != nil {
+			continue
+		}
+		for _, b := range briefs {
+			if b.RuntimeID == runtimeID {
+				continue // 已经在自己名下，前面就能取到
+			}
+			ok, err := h.st.ClaimRun(ctx, b.ID, b.RuntimeID, runtimeID)
+			if err != nil || !ok {
+				continue
+			}
+			r, err := h.st.Run(ctx, b.ID)
+			if err == nil {
+				out = append(out, r)
+			}
+		}
+	}
+	return out
 }

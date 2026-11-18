@@ -12,6 +12,8 @@ import (
 	"regexp"
 	"strings"
 	"time"
+
+	"verdict/internal/protocol"
 )
 
 const maxDiff = 64 << 10
@@ -79,7 +81,16 @@ type Prepared struct {
 }
 
 // Prepare 更新 bare 缓存、把分支解析成 commit，并为本次测试建立独立 worktree。
-func (w Workspace) Prepare(ctx context.Context, runID, repoURL, branch string, log func(string)) (*Prepared, error) {
+// Target 是要测试的代码位置。Commit 非空时锁定到该 commit，否则用 Ref（为空时 refs/heads/<Branch>）的最新提交。
+type Target struct {
+	Branch string
+	Ref    string
+	Commit string
+}
+
+var fullSHA = regexp.MustCompile(`^[0-9a-f]{40}$`)
+
+func (w Workspace) Prepare(ctx context.Context, runID, repoURL string, t Target, log func(string)) (*Prepared, error) {
 	for _, d := range []string{w.reposDir(), w.runsDir()} {
 		if err := os.MkdirAll(d, 0o700); err != nil {
 			return nil, err
@@ -103,12 +114,7 @@ func (w Workspace) Prepare(ctx context.Context, runID, repoURL, branch string, l
 		_, _ = git(ctx, bare, "remote", "set-url", "origin", repoURL)
 	}
 
-	log("拉取分支 " + branch)
-	ref := "refs/heads/" + branch
-	if _, err := git(ctx, bare, "fetch", "--force", "origin", "+"+ref+":"+ref); err != nil {
-		return nil, fmt.Errorf("拉取分支 %s 失败（检查分支是否存在、运行时是否有仓库访问权限）: %w", branch, err)
-	}
-	sha, err := git(ctx, bare, "rev-parse", "--verify", ref+"^{commit}")
+	sha, err := fetchTarget(ctx, bare, t, log)
 	if err != nil {
 		return nil, err
 	}
@@ -230,4 +236,82 @@ func composeDown(ctx context.Context, runID string, log func(string)) {
 	}
 	log("清理 docker compose 项目 " + project)
 	_ = exec.CommandContext(ctx, "docker", "compose", "-p", project, "down", "-v", "--remove-orphans").Run()
+}
+
+// fetchTarget 把目标拉进 bare 缓存，返回被测 commit。
+func fetchTarget(ctx context.Context, bare string, t Target, log func(string)) (string, error) {
+	ref := t.Ref
+	if ref == "" && t.Branch != "" {
+		ref = "refs/heads/" + t.Branch
+	}
+	if t.Commit != "" && !fullSHA.MatchString(t.Commit) {
+		return "", fmt.Errorf("锁定的 commit 不是完整 SHA: %s", t.Commit)
+	}
+	if ref != "" {
+		log("拉取 " + strings.TrimPrefix(strings.TrimPrefix(ref, "refs/heads/"), "refs/tags/"))
+		if _, err := git(ctx, bare, "fetch", "--force", "origin", "+"+ref+":"+ref); err != nil {
+			if t.Commit == "" {
+				return "", fmt.Errorf("拉取 %s 失败（检查分支或 tag 是否存在、运行时是否有仓库访问权限）: %w", ref, err)
+			}
+			log("拉取 " + ref + " 失败，改为直接拉取 commit")
+		}
+	}
+	if t.Commit == "" {
+		return git(ctx, bare, "rev-parse", "--verify", ref+"^{commit}")
+	}
+	if _, err := git(ctx, bare, "cat-file", "-e", t.Commit+"^{commit}"); err != nil {
+		// 分支被 force push 后旧 commit 不再在分支上；多数托管平台允许按 SHA 拉取。
+		if _, ferr := git(ctx, bare, "fetch", "origin", t.Commit); ferr != nil {
+			return "", fmt.Errorf("冻结 commit %s 已不在 %s 上，也无法直接拉取（可能被 force push 后清理了）: %w", t.Commit[:12], firstNonEmpty(ref, "远端"), ferr)
+		}
+		if _, err := git(ctx, bare, "cat-file", "-e", t.Commit+"^{commit}"); err != nil {
+			return "", fmt.Errorf("拉取后仍找不到 commit %s: %w", t.Commit[:12], err)
+		}
+	}
+	return t.Commit, nil
+}
+
+// Resolve 用 git ls-remote 把分支名 / tag / SHA 解析成 commit，不需要本地缓存。
+func Resolve(ctx context.Context, m protocol.Resolve) protocol.Resolved {
+	out := protocol.Resolved{Type: protocol.TypeResolved, ReqID: m.ReqID}
+	ref := strings.TrimSpace(m.Ref)
+	if fullSHA.MatchString(ref) {
+		out.SHA = ref
+		return out
+	}
+	ctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+	defer cancel()
+	cands := []string{ref}
+	if !strings.HasPrefix(ref, "refs/") {
+		cands = []string{"refs/heads/" + ref, "refs/tags/" + ref}
+	}
+	args := []string{"ls-remote", m.RepoURL}
+	for _, c := range cands {
+		args = append(args, c, c+"^{}")
+	}
+	res, err := git(ctx, "", args...)
+	if err != nil {
+		out.Error = "解析失败（检查运行时是否有仓库访问权限）: " + err.Error()
+		return out
+	}
+	found := map[string]string{}
+	for _, line := range strings.Split(res, "\n") {
+		f := strings.Fields(line)
+		if len(f) == 2 {
+			found[f[1]] = f[0]
+		}
+	}
+	for _, c := range cands {
+		// 附注 tag 要取它指向的 commit（^{}），轻量 tag 和分支直接取。
+		if sha := found[c+"^{}"]; sha != "" {
+			out.Ref, out.SHA = c, sha
+			return out
+		}
+		if sha := found[c]; sha != "" {
+			out.Ref, out.SHA = c, sha
+			return out
+		}
+	}
+	out.Error = "远端没有分支或 tag：" + ref + "（如果是 commit，请填写完整的 40 位 SHA）"
+	return out
 }

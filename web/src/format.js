@@ -121,3 +121,9 @@ export function fmtMs(ms) {
   const m = Math.floor(s / 60)
   return m < 60 ? `${m} 分 ${s % 60} 秒` : `${Math.floor(m / 60)} 小时 ${m % 60} 分`
 }
+
+export const versionStatusText = { open: '开发中', frozen: '已冻结', released: '已发布' }
+export const regressionStatusText = { running: '进行中', completed: '已结束', canceled: '已取消' }
+export const regressionVerdictText = { pass: '通过', fail: '未通过', partial: '部分无法验证', incomplete: '未完成' }
+export const caseLevelText = { core: '核心', normal: '普通' }
+export const caseStatusText = { active: '启用', retired: '已停用' }

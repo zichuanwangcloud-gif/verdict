@@ -61,6 +61,24 @@ export const api = {
   updateRepo: (id, r) => call('PUT', `/repos/${id}`, r),
   deleteRepo: (id) => call('DELETE', `/repos/${id}`),
 
+  versions: (repoId) => call('GET', '/versions' + (repoId ? `?repo_id=${repoId}` : '')),
+  createVersion: (v) => call('POST', '/versions', v),
+  version: (id) => call('GET', `/versions/${id}`),
+  updateVersion: (id, v) => call('PATCH', `/versions/${id}`, v),
+  deleteVersion: (id) => call('DELETE', `/versions/${id}`),
+  addVersionIssue: (id, issueKey, move) => call('POST', `/versions/${id}/issues`, { issue_key: issueKey, move: !!move }),
+  removeVersionIssue: (id, key) => call('DELETE', `/versions/${id}/issues/${encodeURIComponent(key)}`),
+  freezeVersion: (id, body) => call('POST', `/versions/${id}/regressions`, body),
+  releaseVersion: (id, note) => call('POST', `/versions/${id}/release`, { note }),
+  retryRegression: (id) => call('POST', `/regressions/${id}/retry`),
+  cancelRegression: (id) => call('POST', `/regressions/${id}/cancel`),
+
+  cases: (repoId) => call('GET', `/repos/${repoId}/cases`),
+  createCase: (repoId, runId, level) => call('POST', `/repos/${repoId}/cases`, { run_id: runId, level }),
+  caseDetail: (id) => call('GET', `/cases/${id}`),
+  updateCase: (id, body) => call('PATCH', `/cases/${id}`, body),
+  deleteCase: (id) => call('DELETE', `/cases/${id}`),
+
   issue: (key) => call('GET', `/issues/${encodeURIComponent(key)}`),
   searchIssues: (q, limit = 20) => call('GET', `/issues?q=${encodeURIComponent(q)}&limit=${limit}`),
 

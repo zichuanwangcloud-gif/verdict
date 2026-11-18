@@ -114,6 +114,10 @@ func writeRules(b *strings.Builder, role string, in Input) {
 	b.WriteString("## 工作区规则\n")
 	fmt.Fprintf(b, "- 当前目录是仓库 %s 在分支 %s 上的一份干净副本。\n", in.RepoURL, in.Branch)
 	b.WriteString("- 不要修改已有的源码文件；可以新建临时脚本、临时测试文件。平台会检查源码改动并在报告里标出。\n")
+	if in.Commit != "" {
+		fmt.Fprintf(b, "- 这是一次回归测试：工作区锁定在 commit %s（版本的冻结节点）。%s\n", in.Commit,
+			map[bool]string{true: "测试计划来自测试 " + in.PlanSource + "；如果计划里的步骤与当前代码对不上（例如页面路径、接口地址变了），以验收标准本身为准判断，并在 reasoning 里说明计划哪里过时了。", false: ""}[in.PlanSource != ""])
+	}
 	if role != RolePlan {
 		b.WriteString("- 截图等产物保存到环境变量 VERDICT_ARTIFACTS 指向的目录。\n")
 		fmt.Fprintf(b, "- 需要用 docker compose 启动依赖时，项目名必须用 `-p verdict-%s`，平台会在测试结束后清理。\n", in.RunID)

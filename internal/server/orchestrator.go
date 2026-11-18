@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"log"
+	"slices"
 	"time"
 
 	"verdict/internal/protocol"
@@ -26,8 +27,9 @@ func (h *Hub) input(ctx context.Context, run store.Run) (testplan.Input, error) 
 	}
 	return testplan.Input{
 		RunID: run.ID, Issue: run.Issue, RepoURL: repo.URL, Branch: run.Branch,
-		Repo:     testplan.RepoInfo{TestNotes: repo.TestNotes, SetupCmd: repo.SetupCmd, StartCmd: repo.StartCmd, HealthURL: repo.HealthURL, AppURL: repo.AppURL},
-		Approved: run.Approved, ApprovalNote: run.ApprovalNote,
+		Repo:       testplan.RepoInfo{TestNotes: repo.TestNotes, SetupCmd: repo.SetupCmd, StartCmd: repo.StartCmd, HealthURL: repo.HealthURL, AppURL: repo.AppURL},
+		Approved:   run.Approved, ApprovalNote: run.ApprovalNote,
+		Commit: run.PinSHA, PlanSource: run.PlanSource,
 	}, nil
 }
 
@@ -74,6 +76,16 @@ func (h *Hub) advance(ctx context.Context, runID string) error {
 	stages, err := h.st.Stages(ctx, run.ID)
 	if err != nil {
 		return err
+	}
+	// 回归测试复用旧计划：第一次推进时把计划阶段直接写成已完成，跳过重新规划。
+	if run.PresetPlan != "" && testplan.ParsePlan(store.Records(stages)) == nil &&
+		!slices.ContainsFunc(stages, func(st store.Stage) bool { return st.Role == testplan.RolePlan }) {
+		if err := h.st.AddPresetPlan(ctx, run.ID, firstNonEmpty(run.PlanSource, "（手动加入的基线用例）"), run.PresetPlan); err != nil {
+			return err
+		}
+		if stages, err = h.st.Stages(ctx, run.ID); err != nil {
+			return err
+		}
 	}
 	for _, st := range stages {
 		if !testplan.Done(st.Status) {
@@ -271,4 +283,13 @@ func (h *Hub) sweep(ctx context.Context, now time.Time) {
 			go h.Schedule(rt.ID)
 		}
 	}
+}
+
+func firstNonEmpty(s ...string) string {
+	for _, x := range s {
+		if x != "" {
+			return x
+		}
+	}
+	return ""
 }

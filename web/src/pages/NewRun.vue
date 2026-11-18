@@ -21,6 +21,11 @@ const previewing = ref(false)
 
 const repoId = ref('')
 const branch = ref('')
+const versions = ref([])
+const versionId = ref('')
+const newVersion = ref('')
+const versionConflict = ref('')
+const createVersionInline = ref(false)
 const runtimeId = ref('')
 const harness = ref('claude')
 const tiers = ref([])
@@ -43,6 +48,38 @@ onMounted(async () => {
 })
 
 const runtime = computed(() => runtimes.value.find((r) => r.id === runtimeId.value))
+
+// 版本跟仓库走；只有 Linear issue 能归入版本。
+const repoVersions = computed(() => versions.value.filter((v) => v.repo_id === repoId.value && v.status !== 'released'))
+watch(repoId, async (id) => {
+  versionId.value = ''
+  versionConflict.value = ''
+  newVersion.value = ''
+  createVersionInline.value = false
+  if (!id) return
+  try {
+    versions.value = await api.versions(id)
+  } catch {
+    versions.value = []
+  }
+})
+watch(mode, () => {
+  if (mode.value !== 'linear') versionId.value = ''
+})
+
+async function makeVersion() {
+  versionConflict.value = ''
+  if (!newVersion.value.trim() || !repoId.value) return
+  try {
+    const v = await api.createVersion({ repo_id: repoId.value, name: newVersion.value.trim() })
+    versions.value = [v, ...versions.value]
+    versionId.value = v.id
+    newVersion.value = ''
+    createVersionInline.value = false
+  } catch (e) {
+    versionConflict.value = e.message
+  }
+}
 
 function preset(t) {
   return tiers.value.find((x) => x.tier === t) || {}
@@ -140,6 +177,11 @@ async function submit() {
     }
     if (tier.value === 'custom') body.config = { ...custom.value, max_minutes: Number(maxMinutes.value) || 0 }
     if (mode.value === 'linear') body.issue_key = issueKey.value.trim()
+    if (versionId.value) {
+      body.version_id = versionId.value
+      // 选了版本但 issue 已在别的版本里：用户在这里明确选了这个版本，默认移动过来。
+      body.version_move = true
+    }
     else body.manual_issue = manual.value
     const run = await api.createRun(body)
     go('/runs/' + run.id)
@@ -224,6 +266,22 @@ async function submit() {
           <input v-model="branch" placeholder="feature/login" class="mono" />
           <span class="hint">会被解析成具体 commit，报告绑定在 commit 上</span>
         </div>
+      </div>
+      <div v-if="mode === 'linear'" class="field">
+        <label>版本（可选）</label>
+        <div class="row" style="gap: 8px; flex-wrap: nowrap">
+          <select v-model="versionId" style="flex: 1">
+            <option value="">不归入版本</option>
+            <option v-for="v in repoVersions" :key="v.id" :value="v.id">{{ v.name }}（{{ v.issue_count }} 个 issue）</option>
+          </select>
+          <button type="button" class="btn sm" @click="createVersionInline = !createVersionInline">新建版本</button>
+        </div>
+        <div v-if="createVersionInline" class="row" style="gap: 8px; flex-wrap: nowrap">
+          <input v-model="newVersion" placeholder="1.4.0" style="flex: 1" @keydown.enter.prevent="makeVersion" />
+          <button type="button" class="btn sm primary" :disabled="!newVersion.trim()" @click="makeVersion">创建</button>
+        </div>
+        <div v-if="versionConflict" class="alert bad">{{ versionConflict }}</div>
+        <span class="hint">归入版本后，版本冻结时这个 issue 会在最终代码上重测一次；issue 已在别的版本里时会移过来。</span>
       </div>
     </section>
 

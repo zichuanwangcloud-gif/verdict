@@ -92,6 +92,18 @@ func (s *Store) AddStage(ctx context.Context, runID string, spec testplan.StageS
 	return s.Stage(ctx, id)
 }
 
+// AddPresetPlan 直接写入一个已完成的计划阶段（回归测试复用旧计划时用）。
+func (s *Store) AddPresetPlan(ctx context.Context, runID, source string, plan string) error {
+	spec := testplan.StageSpec{Role: testplan.RolePlan, Kind: protocol.StageKindHarness}
+	id := runID + "-" + RandomHex(3)
+	t := now()
+	_, err := s.db.ExecContext(ctx, `INSERT INTO stages(id, run_id, seq, role, round, kind, harness, status, note, spec, output, created_at, started_at, finished_at)
+ VALUES(?, ?, (SELECT COALESCE(MAX(seq), 0) + 1 FROM stages WHERE run_id=?), ?, 0, ?, '', ?, ?, ?, ?, ?, ?, ?)`,
+		id, runID, runID, testplan.RolePlan, protocol.StageKindHarness, testplan.StatusOK,
+		"复用测试 "+source+" 的计划（回归不重新规划）", toJSON(spec), plan, t, t, t)
+	return err
+}
+
 func (s *Store) MarkStage(ctx context.Context, id, status string) error {
 	q := `UPDATE stages SET status=?`
 	args := []any{status}

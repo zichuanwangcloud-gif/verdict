@@ -51,6 +51,8 @@ type runInput struct {
 	ApprovePlan *bool            `json:"approve_plan"` // 覆盖预设
 	MaxMinutes  int              `json:"max_minutes"`  // 覆盖预设
 	MaxCostUSD  *float64         `json:"max_cost_usd"` // 覆盖预设
+	VersionID   int64            `json:"version_id"`   // 归入版本（可选）
+	VersionMove bool             `json:"version_move"` // issue 已在别的版本里时是否移动过来
 }
 
 func validBranch(b string) bool {
@@ -138,7 +140,7 @@ func (s *Server) startRun(ctx context.Context, in runInput) (store.Run, int, err
 	var issue linear.Issue
 	switch {
 	case strings.TrimSpace(in.IssueKey) != "":
-		issue, err = linear.New(s.linearKey(ctx)).GetIssue(ctx, strings.TrimSpace(in.IssueKey))
+		issue, err = linearClient(s.linearKey(ctx)).GetIssue(ctx, strings.TrimSpace(in.IssueKey))
 		if err != nil {
 			return store.Run{}, http.StatusBadGateway, err
 		}
@@ -151,8 +153,28 @@ func (s *Server) startRun(ctx context.Context, in runInput) (store.Run, int, err
 		return store.Run{}, http.StatusBadRequest, errors.New("请填写 Linear issue 编号，或手动输入需求")
 	}
 
-	run, err := s.st.CreateRun(ctx, store.NewRun{RepoID: repo.ID, Branch: in.Branch, Issue: issue, RuntimeID: rt.ID,
-		Config: resolveConfig(in, rt.Info)})
+	newRun := store.NewRun{RepoID: repo.ID, Branch: in.Branch, Issue: issue, RuntimeID: rt.ID, Config: resolveConfig(in, rt.Info)}
+	if in.VersionID > 0 {
+		v, err := s.st.Version(ctx, in.VersionID)
+		switch {
+		case errors.Is(err, store.ErrNotFound) || (err == nil && v.RepoID != repo.ID):
+			return store.Run{}, http.StatusBadRequest, errors.New("版本不存在或不属于这个仓库")
+		case err == nil && v.Status == store.VersionReleased:
+			return store.Run{}, http.StatusBadRequest, errors.New("版本已发布，不能再往里加测试")
+		case err != nil:
+			return store.Run{}, http.StatusInternalServerError, err
+		case issue.Identifier == "MANUAL":
+			return store.Run{}, http.StatusBadRequest, errors.New("手动输入的需求不能归入版本（版本要按 issue 编号跨版本积累回归）")
+		}
+		if err := s.st.AddVersionIssue(ctx, v, issue, in.VersionMove); err != nil {
+			if errors.Is(err, store.ErrIssueInOtherVersion) {
+				return store.Run{}, http.StatusConflict, err
+			}
+			return store.Run{}, http.StatusInternalServerError, err
+		}
+		newRun.VersionID = v.ID
+	}
+	run, err := s.st.CreateRun(ctx, newRun)
 	if err != nil {
 		return store.Run{}, http.StatusInternalServerError, err
 	}
@@ -201,6 +223,10 @@ func (s *Server) cancelRun(w http.ResponseWriter, r *http.Request) {
 		failErr(w, err)
 		return
 	}
+	if run.RegressionID != "" {
+		fail(w, http.StatusConflict, "回归子测试请在回归轮次里取消整轮")
+		return
+	}
 	if err := s.hub.Cancel(r.Context(), run); err != nil {
 		fail(w, http.StatusConflict, err.Error())
 		return
@@ -240,6 +266,13 @@ func (s *Server) rerun(w http.ResponseWriter, r *http.Request) {
 		approve, cost := cfg.ApprovePlan, cfg.MaxCostUSD
 		in.ApprovePlan, in.MaxMinutes, in.MaxCostUSD = &approve, cfg.MaxMinutes, &cost
 	}
+	if old.RegressionID != "" {
+		fail(w, http.StatusConflict, "回归子测试不能这样重跑，请在回归轮次里重跑未通过的项")
+		return
+	}
+	if old.VersionID > 0 {
+		in.VersionID, in.VersionMove = old.VersionID, true
+	}
 	if old.Issue.ID != "" {
 		in.IssueKey = old.IssueKey // 重新拉取最新的 issue 内容
 	} else {
@@ -263,7 +296,7 @@ func (s *Server) retryWriteBack(w http.ResponseWriter, r *http.Request) {
 		fail(w, http.StatusConflict, "测试尚未结束")
 		return
 	}
-	s.writeBack(run.ID)
+	s.writeBackForce(run.ID, true)
 	run, _ = s.st.Run(r.Context(), run.ID)
 	ok(w, run)
 }

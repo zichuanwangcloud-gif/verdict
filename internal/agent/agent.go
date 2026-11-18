@@ -267,6 +267,21 @@ func (a *Agent) handle(ctx context.Context, conn *websocket.Conn, data []byte) e
 		}
 		log.Printf("收到取消：%s", m.RunID)
 		a.onEnd(m.RunID, protocol.ClosedResult{Canceled: true})
+	case protocol.TypeResolve:
+		m, err := decodeAs[protocol.Resolve](data)
+		if err != nil {
+			return err
+		}
+		go func() {
+			res := Resolve(ctx, m)
+			a.mu.Lock()
+			defer a.mu.Unlock()
+			if a.conn == conn {
+				if err := a.write(ctx, conn, res); err != nil {
+					conn.CloseNow()
+				}
+			}
+		}()
 	case protocol.TypeProbe:
 		go func() {
 			info := Probe(ctx)

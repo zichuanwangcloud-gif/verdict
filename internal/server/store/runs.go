@@ -45,6 +45,14 @@ type Run struct {
 	Error            string              `json:"error"`
 	LinearCommentURL string              `json:"linear_comment_url"`
 	LinearError      string              `json:"linear_error"`
+	VersionID        int64               `json:"version_id"`
+	RegressionID     string              `json:"regression_id"`
+	CaseID           int64               `json:"case_id"`
+	PinRef           string              `json:"pin_ref"`
+	PinSHA           string              `json:"pin_sha"`
+	PlanSource       string              `json:"plan_source"`
+	PresetPlan       string              `json:"-"`
+	Attempt          int                 `json:"attempt"`
 	CreatedAt        *time.Time          `json:"created_at"`
 	StartedAt        *time.Time          `json:"started_at"`
 	FinishedAt       *time.Time          `json:"finished_at"`
@@ -53,7 +61,8 @@ type Run struct {
 const runCols = `r.id, r.repo_id, p.url, p.name, r.branch, r.commit_sha, r.issue_key, r.issue, r.runtime_id, t.name,
  r.harness, r.tier, r.config, r.timeout_minutes, r.status, r.current_stage, r.verdict, r.summary, r.acs, r.findings, r.pages,
  r.approved, r.approval_note, r.awaiting_since, r.source_modified, r.diff, r.prompt, r.raw, r.cost_usd, r.error,
- r.linear_comment_url, r.linear_error, r.created_at, r.started_at, r.finished_at
+ r.linear_comment_url, r.linear_error, r.version_id, r.regression_id, r.case_id, r.pin_ref, r.pin_sha, r.plan_source,
+ r.preset_plan, r.attempt, r.created_at, r.started_at, r.finished_at
  FROM runs r JOIN repos p ON p.id=r.repo_id JOIN runtimes t ON t.id=r.runtime_id`
 
 func scanRun(sc interface{ Scan(...any) error }) (Run, error) {
@@ -63,7 +72,8 @@ func scanRun(sc interface{ Scan(...any) error }) (Run, error) {
 	err := sc.Scan(&r.ID, &r.RepoID, &r.RepoURL, &r.RepoName, &r.Branch, &r.CommitSHA, &r.IssueKey, &issue, &r.RuntimeID,
 		&r.RuntimeName, &r.Harness, &r.Tier, &cfg, &r.TimeoutMinutes, &r.Status, &r.CurrentStage, &r.Verdict, &r.Summary,
 		&acs, &findings, &pages, &approved, &r.ApprovalNote, &awaiting, &modified, &r.Diff, &r.Prompt, &r.Raw, &r.CostUSD,
-		&r.Error, &r.LinearCommentURL, &r.LinearError, &created, &started, &finished)
+		&r.Error, &r.LinearCommentURL, &r.LinearError, &r.VersionID, &r.RegressionID, &r.CaseID, &r.PinRef, &r.PinSHA,
+		&r.PlanSource, &r.PresetPlan, &r.Attempt, &created, &started, &finished)
 	if err != nil {
 		return r, err
 	}
@@ -96,17 +106,37 @@ type NewRun struct {
 	Issue     linear.Issue
 	RuntimeID int64
 	Config    testplan.Config
+	// 以下用于版本与回归测试，普通测试留空。
+	VersionID    int64
+	RegressionID string
+	CaseID       int64
+	PinRef       string
+	PinSHA       string
+	PlanSource   string
+	PresetPlan   string
+	Attempt      int
 }
 
 func (s *Store) CreateRun(ctx context.Context, n NewRun) (Run, error) {
-	id := RandomHex(6)
-	_, err := s.db.ExecContext(ctx, `INSERT INTO runs(id, repo_id, branch, issue_key, issue, runtime_id, harness, tier, config, timeout_minutes, status, prompt, created_at)
- VALUES(?,?,?,?,?,?,?,?,?,?,?,'',?)`, id, n.RepoID, n.Branch, n.Issue.Identifier, toJSON(n.Issue), n.RuntimeID, n.Config.Harness,
-		n.Config.Tier, toJSON(n.Config), n.Config.MaxMinutes, StatusQueued, now())
+	id, err := s.insertRun(ctx, s.db, n)
 	if err != nil {
 		return Run{}, err
 	}
 	return s.Run(ctx, id)
+}
+
+type execer interface {
+	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
+}
+
+func (s *Store) insertRun(ctx context.Context, db execer, n NewRun) (string, error) {
+	id := RandomHex(6)
+	_, err := db.ExecContext(ctx, `INSERT INTO runs(id, repo_id, branch, issue_key, issue, runtime_id, harness, tier, config, timeout_minutes, status, prompt,
+ version_id, regression_id, case_id, pin_ref, pin_sha, plan_source, preset_plan, attempt, created_at)
+ VALUES(?,?,?,?,?,?,?,?,?,?,?,'',?,?,?,?,?,?,?,?,?)`, id, n.RepoID, n.Branch, n.Issue.Identifier, toJSON(n.Issue), n.RuntimeID, n.Config.Harness,
+		n.Config.Tier, toJSON(n.Config), n.Config.MaxMinutes, StatusQueued, n.VersionID, n.RegressionID, n.CaseID, n.PinRef, n.PinSHA,
+		n.PlanSource, n.PresetPlan, max(n.Attempt, 1), now())
+	return id, err
 }
 
 func (s *Store) Run(ctx context.Context, id string) (Run, error) {
@@ -117,8 +147,9 @@ func (s *Store) Run(ctx context.Context, id string) (Run, error) {
 	return r, err
 }
 
+// Runs 返回普通测试记录（不含回归子测试，它们在版本页里看）。
 func (s *Store) Runs(ctx context.Context, limit int) ([]Run, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT `+runCols+` ORDER BY r.created_at DESC, r.rowid DESC LIMIT ?`, limit)
+	rows, err := s.db.QueryContext(ctx, `SELECT `+runCols+` WHERE r.regression_id='' ORDER BY r.created_at DESC, r.rowid DESC LIMIT ?`, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -130,7 +161,7 @@ func (s *Store) Runs(ctx context.Context, limit int) ([]Run, error) {
 			return nil, err
 		}
 		// 列表不带大字段。
-		r.Prompt, r.Raw, r.Diff, r.Pages = "", "", "", nil
+		r.Prompt, r.Raw, r.Diff, r.Pages, r.PresetPlan = "", "", "", nil, ""
 		for i := range r.ACs {
 			r.ACs[i].Evidence, r.ACs[i].Reasoning, r.ACs[i].Challenges = "", "", nil
 		}

@@ -1,6 +1,6 @@
 <script setup>
 import { computed } from 'vue'
-import { FlaskConical, Server, GitBranch, Settings as SettingsIcon, LogOut, Sun, Moon, ScanSearch } from 'lucide-vue-next'
+import { FlaskConical, Server, GitBranch, Settings as SettingsIcon, LogOut, Sun, Moon, ScanSearch, PackageCheck, ShieldCheck } from 'lucide-vue-next'
 import { auth, setToken } from './api'
 import { route, go, match } from './router'
 import { theme, toggleTheme } from './theme'
@@ -11,9 +11,14 @@ import RunDetail from './pages/RunDetail.vue'
 import Runtimes from './pages/Runtimes.vue'
 import Repos from './pages/Repos.vue'
 import Settings from './pages/Settings.vue'
+import Versions from './pages/Versions.vue'
+import VersionDetail from './pages/VersionDetail.vue'
+import Cases from './pages/Cases.vue'
 
 const tabs = [
   { path: '/runs', label: '验收测试', icon: FlaskConical },
+  { path: '/versions', label: '版本', icon: PackageCheck },
+  { path: '/cases', label: '回归基线', icon: ShieldCheck },
   { path: '/runtimes', label: '运行时', icon: Server },
   { path: '/repos', label: '仓库', icon: GitBranch },
   { path: '/settings', label: '设置', icon: SettingsIcon },
@@ -23,6 +28,10 @@ const view = computed(() => {
   if (match('/runs/new')) return { comp: NewRun, props: {} }
   const r = match('/runs/:id')
   if (r) return { comp: RunDetail, props: { id: r.id } }
+  if (match('/versions')) return { comp: Versions, props: {} }
+  const v = match('/versions/:id')
+  if (v) return { comp: VersionDetail, props: { id: v.id } }
+  if (match('/cases')) return { comp: Cases, props: {} }
   if (match('/runtimes')) return { comp: Runtimes, props: {} }
   if (match('/repos')) return { comp: Repos, props: {} }
   if (match('/settings')) return { comp: Settings, props: {} }
