@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	urlpkg "net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -143,6 +144,10 @@ func runSetup(ctx context.Context, dir, script string, env []string, logf func(s
 
 // startService 执行安装命令、后台启动服务，并等待健康检查通过。
 func (a *Agent) startService(ctx context.Context, s *session, spec protocol.ServiceSpec, logf func(string)) (*service, protocol.ServiceStatus, error) {
+	// 安装 / 启动命令交给 sh 执行，占位符由 shell 从环境变量展开；
+	// 但健康检查和前端地址是 agent 自己发 HTTP 请求用的，不会经过 shell，必须在这里替换。
+	spec.SetupCmd, spec.StartCmd = s.expand(spec.SetupCmd), s.expand(spec.StartCmd)
+	spec.HealthURL, spec.AppURL = s.expand(spec.HealthURL), s.expand(spec.AppURL)
 	st := protocol.ServiceStatus{StartCmd: spec.StartCmd, HealthURL: spec.HealthURL, URL: firstNonEmpty(spec.AppURL, spec.HealthURL)}
 	env := s.env()
 
@@ -165,6 +170,12 @@ func (a *Agent) startService(ctx context.Context, s *session, spec protocol.Serv
 		return nil, st, err
 	}
 
+	for _, u := range []string{spec.HealthURL, spec.AppURL} {
+		if strings.Contains(u, "VERDICT_PORT") {
+			return nil, st, fmt.Errorf("地址 %q 里的端口占位符没有取到值：这个仓库声明了 %d 个端口，"+
+				"请检查命令里用的编号（VERDICT_PORT、VERDICT_PORT1…）和仓库设置里的端口数", u, s.portCount)
+		}
+	}
 	logf("▶ 启动服务：" + spec.StartCmd)
 	cmd := shellCmd(nil, s.prep.Dir, spec.StartCmd, env)
 	pr, pw := io.Pipe()
@@ -209,6 +220,47 @@ func (a *Agent) startService(ctx context.Context, s *session, spec protocol.Serv
 	return svc, st, nil
 }
 
+// validHTTPURL 粗查健康检查 / 前端地址：必须是 http(s) 且带端口，或带默认端口的标准地址。
+func validHTTPURL(raw string) error {
+	u, err := urlpkg.Parse(raw)
+	if err != nil {
+		return fmt.Errorf("地址不合法 %q：%v（检查仓库配置里的端口占位符）", raw, err)
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return fmt.Errorf("地址不合法 %q：必须以 http:// 或 https:// 开头", raw)
+	}
+	if u.Hostname() == "" {
+		return fmt.Errorf("地址不合法 %q：缺少主机名", raw)
+	}
+	// "http://127.0.0.1:" 这类写法会解析成 Host="127.0.0.1:"、端口为空，实际连不上。
+	if strings.HasSuffix(u.Host, ":") {
+		return fmt.Errorf("地址不合法 %q：端口是空的（检查仓库配置里的端口占位符有没有展开）", raw)
+	}
+	return nil
+}
+
+// expand 把配置里的端口占位符替换成实际分配到的端口。
+// 支持 VERDICT_PORT（第一个）、VERDICT_PORT1..N（第 n 个）；未分配的编号替换为空串并由调用方报错。
+func (s *session) expand(v string) string {
+	if !strings.Contains(v, "VERDICT_PORT") {
+		return v
+	}
+		// 与 env() 保持一致：VERDICT_PORT 和 VERDICT_PORT1 都指向第一个端口，PORTn 指向第 n 个。
+	for i := 0; i < 9; i++ {
+		key := "VERDICT_PORT"
+		if i > 0 {
+			key = fmt.Sprintf("VERDICT_PORT%d", i)
+		}
+		idx := max(i-1, 0) // VERDICT_PORT → 0，VERDICT_PORT1 → 0，VERDICT_PORT2 → 1
+		val := ""
+		if idx < len(s.ports) {
+			val = strconv.Itoa(s.ports[idx])
+		}
+		v = strings.ReplaceAll(v, "${"+key+"}", val)
+	}
+	return v
+}
+
 func waitHealthy(ctx context.Context, svc *service, url string, logf func(string)) error {
 	if strings.TrimSpace(url) == "" {
 		select {
@@ -220,6 +272,10 @@ func waitHealthy(ctx context.Context, svc *service, url string, logf func(string
 			return context.Cause(ctx)
 		}
 	}
+	// 先把地址解析一次：端口缺失、占位符残留这类问题重试也没用，立刻报错。
+	if err := validHTTPURL(url); err != nil {
+		return err
+	}
 	logf("… 等待健康检查 " + url)
 	deadline := time.Now().Add(healthTimeout)
 	client := &http.Client{Timeout: 5 * time.Second}
@@ -228,7 +284,11 @@ func waitHealthy(ctx context.Context, svc *service, url string, logf func(string
 		if !svc.alive() {
 			return errors.New("服务进程在健康检查通过前退出")
 		}
-		req, _ := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+		if err != nil {
+			// 地址本身不合法（例如残留了没被替换的占位符），重试没有意义。
+			return fmt.Errorf("健康检查地址不合法 %q：%v（检查仓库配置里的占位符是否都被平台替换了）", url, err)
+		}
 		resp, err := client.Do(req)
 		if err == nil {
 			resp.Body.Close()
