@@ -10,7 +10,9 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -93,82 +95,211 @@ type IssueSummary struct {
 	URL        string `json:"url"`
 }
 
+// 搜 issue 时一次最多返回多少条（Linear 的 first 上限是 250）。
+const searchCap = 50
+
+var identifierRe = regexp.MustCompile(`^([A-Za-z][A-Za-z0-9]*)-(\d*)$`)
+
 // SearchIssues 按关键字搜索 issue。query 为空时返回最近更新的 issue。
-// 关键字同时匹配编号（如 ENG-12）和标题；匹配到编号时把精确命中的排在前面。
+//
+// Linear 的 IssueFilter 不支持按 identifier 过滤，searchIssues 又是模糊语义搜索（输入 ENG-1
+// 第一条可能毫不相关）。所以这里组合两种查询，再在本地按编号精确排序：
+//   - 像编号的输入（ENG-142 / ENG-1）→ 团队 key + 编号范围过滤，拿到同团队的全部候选后在本地筛前缀；
+//   - 其他输入 → 标题包含匹配 + 全文搜索，按最近更新合并。
 func (c *Client) SearchIssues(ctx context.Context, query string, limit int) ([]IssueSummary, error) {
-	if limit <= 0 {
-		limit = 20
+	if limit <= 0 || limit > searchCap {
+		limit = searchCap
 	}
 	query = strings.TrimSpace(query)
+	cands := map[string]IssueSummary{}
+	add := func(list []IssueSummary) {
+		for _, s := range list {
+			if prev, ok := cands[s.Identifier]; !ok || prev.UpdatedAt < s.UpdatedAt {
+				cands[s.Identifier] = s
+			}
+		}
+	}
+
+	if query == "" {
+		list, err := c.listIssues(ctx, nil, limit)
+		if err != nil {
+			return nil, err
+		}
+		return capList(rank(list, ""), limit), nil
+	}
+
+	if m := identifierRe.FindStringSubmatch(query); m != nil {
+		team, digits := strings.ToUpper(m[1]), m[2]
+		filter := map[string]any{"team": map[string]any{"key": map[string]any{"eq": team}}}
+		if digits != "" {
+			// 数字部分是按前缀匹配的：142 应命中 142、1420…，而数字前缀不是连续区间，
+			// 要展开成 1、10-19、100-199… 这样的多段区间。
+			filter = map[string]any{"and": []any{filter, map[string]any{"or": numberPrefixRanges(digits)}}}
+		}
+		list, err := c.listIssues(ctx, filter, searchCap)
+		if err == nil {
+			add(list)
+		}
+		// 团队 key 不存在、区间不被支持或没有命中时，退回全文搜索（用户可能输错了团队）。
+		if err != nil || len(cands) == 0 {
+			got, serr := c.searchIssues(ctx, query, limit)
+			if serr != nil {
+				if err != nil {
+					return nil, err
+				}
+				return nil, serr
+			}
+			add(got)
+		}
+	} else {
+		list, err := c.listIssues(ctx, map[string]any{"title": map[string]any{"containsIgnoreCase": query}}, searchCap)
+		if err != nil {
+			return nil, err
+		}
+		add(list)
+		// 标题没搜到时不打扰用户；关键词可能出现在描述或评论里，再补一轮全文搜索。
+		if len(cands) < limit {
+			if got, err := c.searchIssues(ctx, query, limit); err == nil {
+				add(got)
+			}
+		}
+	}
+
+	out := make([]IssueSummary, 0, len(cands))
+	for _, s := range cands {
+		out = append(out, s)
+	}
+	return capList(rank(out, query), limit), nil
+}
+
+// numberPrefixRanges 把数字前缀展开成若干闭区间。前缀匹配的编号是
+// 14、140-149、1400-1499……，不是一段连续区间，所以要展开：
+// "1" → [1,1] [10,19] [100,199]…，"14" → [14,14] [140,149] [1400,1499]…
+func numberPrefixRanges(digits string) []any {
+	const maxDigits = 7 // 超过这个位数就不做前缀展开（量级不现实，也避免过多区间）
+	lo, err := strconv.Atoi(digits)
+	if err != nil || lo < 0 {
+		return nil
+	}
+	var out []any
+	span := 1
+	for i := 0; i < maxDigits; i++ {
+		out = append(out, map[string]any{"number": map[string]any{"gte": lo, "lte": lo + span - 1}})
+		lo *= 10
+		span *= 10
+		if lo > 100_000_000 {
+			break
+		}
+	}
+	return out
+}
+
+// rank 让编号完全匹配、其次编号以关键字开头的排前面，其余按最近更新。
+func rank(list []IssueSummary, query string) []IssueSummary {
+	up := strings.ToUpper(strings.TrimSpace(query))
+	sort.SliceStable(list, func(i, j int) bool {
+		ri, rj := 3, 3
+		if up != "" {
+			ri, rj = idRank(list[i].Identifier, up), idRank(list[j].Identifier, up)
+		}
+		if ri != rj {
+			return ri < rj
+		}
+		return list[i].UpdatedAt > list[j].UpdatedAt
+	})
+	return list
+}
+
+func idRank(id, up string) int {
+	id = strings.ToUpper(id)
+	switch {
+	case id == up:
+		return 0
+	case strings.HasPrefix(id, up):
+		return 1
+	}
+	return 3
+}
+
+func capList(list []IssueSummary, n int) []IssueSummary {
+	if len(list) > n {
+		return list[:n]
+	}
+	return list
+}
+
+type issueNode = struct {
+	ID         string `json:"id"`
+	Identifier string `json:"identifier"`
+	Title      string `json:"title"`
+	URL        string `json:"url"`
+	UpdatedAt  string `json:"updatedAt"`
+	State      *struct {
+		Name string `json:"name"`
+	} `json:"state"`
+	Team *struct {
+		Name string `json:"name"`
+		Key  string `json:"key"`
+	} `json:"team"`
+	Assignee *struct {
+		DisplayName string `json:"displayName"`
+	} `json:"assignee"`
+}
+
+func toSummary(n issueNode) IssueSummary {
+	s := IssueSummary{ID: n.ID, Identifier: n.Identifier, Title: n.Title, URL: n.URL, UpdatedAt: n.UpdatedAt}
+	if n.State != nil {
+		s.State = n.State.Name
+	}
+	if n.Team != nil {
+		s.Team = n.Team.Name
+	}
+	if n.Assignee != nil {
+		s.Assignee = n.Assignee.DisplayName
+	}
+	return s
+}
+
+// listIssues 用 issues(filter:) 查询，按最近更新排序。
+func (c *Client) listIssues(ctx context.Context, filter map[string]any, limit int) ([]IssueSummary, error) {
 	const q = `query($filter: IssueFilter, $first: Int) {
   issues(filter: $filter, first: $first, orderBy: updatedAt) {
-    nodes {
-      id identifier title url updatedAt
-      state { name }
-      team { name key }
-      assignee { displayName }
-    }
+    nodes { id identifier title url updatedAt state { name } team { name key } assignee { displayName } }
   }
 }`
-	vars := map[string]any{"first": limit}
-	if query != "" {
-		// 编号或标题包含关键字，都要能搜到。
-		vars["filter"] = map[string]any{"or": []any{
-			map[string]any{"identifier": map[string]any{"containsIgnoreCase": query}},
-			map[string]any{"title": map[string]any{"containsIgnoreCase": query}},
-		}}
-	}
 	var out struct {
 		Issues struct {
-			Nodes []struct {
-				ID         string `json:"id"`
-				Identifier string `json:"identifier"`
-				Title      string `json:"title"`
-				URL        string `json:"url"`
-				UpdatedAt  string `json:"updatedAt"`
-				State      *struct {
-					Name string `json:"name"`
-				} `json:"state"`
-				Team *struct {
-					Name string `json:"name"`
-					Key  string `json:"key"`
-				} `json:"team"`
-				Assignee *struct {
-					DisplayName string `json:"displayName"`
-				} `json:"assignee"`
-			} `json:"nodes"`
+			Nodes []issueNode `json:"nodes"`
 		} `json:"issues"`
 	}
-	if err := c.do(ctx, q, vars, &out); err != nil {
+	if err := c.do(ctx, q, map[string]any{"filter": filter, "first": limit}, &out); err != nil {
 		return nil, err
 	}
 	res := make([]IssueSummary, 0, len(out.Issues.Nodes))
 	for _, n := range out.Issues.Nodes {
-		s := IssueSummary{ID: n.ID, Identifier: n.Identifier, Title: n.Title, URL: n.URL, UpdatedAt: n.UpdatedAt}
-		if n.State != nil {
-			s.State = n.State.Name
-		}
-		if n.Team != nil {
-			s.Team = n.Team.Name
-		}
-		if n.Assignee != nil {
-			s.Assignee = n.Assignee.DisplayName
-		}
-		res = append(res, s)
+		res = append(res, toSummary(n))
 	}
-	// 排序：编号完全相同的最前，其次是编号以关键字开头的，其余保持接口返回的最近更新顺序。
-	if up := strings.ToUpper(query); up != "" {
-		rank := func(s string) int {
-			id := strings.ToUpper(s)
-			switch {
-			case id == up:
-				return 0
-			case strings.HasPrefix(id, up):
-				return 1
-			}
-			return 2
-		}
-		sort.SliceStable(res, func(i, j int) bool { return rank(res[i].Identifier) < rank(res[j].Identifier) })
+	return res, nil
+}
+
+// searchIssues 用全文搜索，结果与关键词相关性有关。
+func (c *Client) searchIssues(ctx context.Context, term string, limit int) ([]IssueSummary, error) {
+	const q = `query($term: String!, $first: Int) {
+  searchIssues(term: $term, first: $first) {
+    nodes { id identifier title url updatedAt state { name } team { name key } assignee { displayName } }
+  }
+}`
+	var out struct {
+		SearchIssues struct {
+			Nodes []issueNode `json:"nodes"`
+		} `json:"searchIssues"`
+	}
+	if err := c.do(ctx, q, map[string]any{"term": term, "first": limit}, &out); err != nil {
+		return nil, err
+	}
+	res := make([]IssueSummary, 0, len(out.SearchIssues.Nodes))
+	for _, n := range out.SearchIssues.Nodes {
+		res = append(res, toSummary(n))
 	}
 	return res, nil
 }
