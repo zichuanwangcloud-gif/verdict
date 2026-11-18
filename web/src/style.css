@@ -732,3 +732,4 @@ details[open] > summary { margin-bottom: 12px; }
 .ip-empty { display: flex; flex-direction: column; align-items: center; gap: 6px; padding: 22px 12px; color: var(--muted); font-size: 12.5px; text-align: center; }
 /* 卡片有 backdrop-filter，各自形成层叠上下文；下拉展开时把所在卡片提到上层 */
 .card.z-top { position: relative; z-index: 20; }
+.ip-meta .chip.mine { color: var(--violet); background: var(--grad-soft); border-color: color-mix(in srgb, var(--violet) 30%, transparent); }

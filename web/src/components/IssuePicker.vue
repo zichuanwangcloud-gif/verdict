@@ -1,6 +1,6 @@
 <script setup>
 import { ref, computed, watch, onMounted, onUnmounted, nextTick } from 'vue'
-import { Search, Loader, X, Inbox, CornerDownLeft } from 'lucide-vue-next'
+import { Search, Loader, X, Inbox, CornerDownLeft, UserRound } from 'lucide-vue-next'
 import { api } from '../api'
 
 const props = defineProps({ modelValue: String })
@@ -102,7 +102,7 @@ onUnmounted(() => {
 })
 
 const shown = computed(() => (query.value.trim() ? list.value : list.value))
-const emptyHint = computed(() => (loading.value ? '搜索中…' : query.value.trim() ? '匹配结果' : '最近更新的 issue'))
+const emptyHint = computed(() => (loading.value ? '搜索中…' : query.value.trim() ? '全部 issue（分给我的排在最前）' : '分配给我的 issue'))
 </script>
 
 <template>
@@ -113,7 +113,7 @@ const emptyHint = computed(() => (loading.value ? '搜索中…' : query.value.t
         ref="input"
         v-model="query"
         class="ip-input"
-        placeholder="点击搜索或输入编号，如 ENG-123"
+        placeholder="点击查看分配给我的 issue，或输入编号 / 关键字"
         autocomplete="off"
         @focus="focus"
         @click="focus"
@@ -139,14 +139,15 @@ const emptyHint = computed(() => (loading.value ? '搜索中…' : query.value.t
           <span class="ip-id mono">{{ it.identifier }}</span>
           <span class="ip-title">{{ it.title }}</span>
           <span class="ip-meta">
+            <span v-if="it.mine" class="chip mine"><UserRound :size="11" /> 我的</span>
             <span v-if="it.state" class="chip">{{ it.state }}</span>
-            <span v-if="it.assignee" class="muted">{{ it.assignee }}</span>
+            <span v-if="it.assignee && !it.mine" class="muted">{{ it.assignee }}</span>
           </span>
         </button>
         <div v-if="!loading && !shown.length" class="ip-empty">
           <Inbox :size="14" />
           <span v-if="query.trim()">没有找到匹配「{{ query.trim() }}」的 issue</span>
-          <span v-else>还没有 issue 可以选</span>
+          <span v-else>还没有分配给你的 issue</span>
         </div>
         <div class="ip-foot"><CornerDownLeft :size="11" /> 回车选择 · ↑↓ 切换</div>
       </template>
