@@ -140,14 +140,16 @@ type ServiceStatus struct {
 	StartCmd  string `json:"start_cmd,omitempty"`  // 实际使用的启动命令
 	LogTail   string `json:"log_tail,omitempty"`   // 失败时的最后几行输出
 	HealthURL string `json:"health_url,omitempty"` // 实际检查的地址
+	// TeardownCmd 是收尾时要执行的清理命令（删除本次建的独立库等）。
+	TeardownCmd string `json:"teardown_cmd,omitempty"`
 }
 
 // ClosedResult 是收尾结果。Error 非空表示测试被中断（agent 重启、工作区准备失败等）。
 type ClosedResult struct {
-	Canceled       bool   `json:"canceled,omitempty"`
-	Error          string `json:"error,omitempty"`
+	Canceled bool   `json:"canceled,omitempty"`
+	Error    string `json:"error,omitempty"`
 	// Busy 表示运行时并发已满、这个测试根本没有开始；平台应放回队列而不是判失败。
-	Busy bool `json:"busy,omitempty"`
+	Busy           bool   `json:"busy,omitempty"`
 	SourceModified bool   `json:"source_modified"`
 	Diff           string `json:"diff,omitempty"`
 }
@@ -212,6 +214,8 @@ type ServiceSpec struct {
 	StartCmd  string `json:"start_cmd"`
 	HealthURL string `json:"health_url"`
 	AppURL    string `json:"app_url"`
+	// TeardownCmd 由 agent 在测试收尾时执行（服务停止之后），用来删除本次创建的独立库等资源。
+	TeardownCmd string `json:"teardown_cmd,omitempty"`
 }
 
 type Finish struct {

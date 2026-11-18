@@ -45,6 +45,7 @@ const items = computed(() =>
         <div v-if="s.service" class="tl-note">
           <template v-if="s.service.running">服务已就绪 <span class="mono">{{ s.service.url }}</span></template>
           <template v-else>启动命令 <span class="mono">{{ s.service.start_cmd }}</span></template>
+          <div v-if="s.service.teardown_cmd">收尾清理 <span class="mono">{{ s.service.teardown_cmd }}</span></div>
         </div>
       </div>
     </li>

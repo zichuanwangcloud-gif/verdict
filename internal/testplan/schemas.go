@@ -52,10 +52,11 @@ var (
 		"summary":       str,
 		"needs_service": boolean,
 		"service": obj(map[string]any{
-			"setup_cmd":  str,
-			"start_cmd":  str,
-			"health_url": str,
-			"app_url":    str,
+			"setup_cmd":    str,
+			"start_cmd":    str,
+			"health_url":   str,
+			"app_url":      str,
+			"teardown_cmd": str,
 		}),
 		"items": arr(obj(map[string]any{
 			"id":            str,
@@ -120,6 +121,8 @@ type ServiceHint struct {
 	StartCmd  string `json:"start_cmd"`
 	HealthURL string `json:"health_url"`
 	AppURL    string `json:"app_url"`
+	// TeardownCmd 在测试收尾时执行，删除本次在共享容器里建的库、清空占用的 redis 编号等。
+	TeardownCmd string `json:"teardown_cmd"`
 }
 
 type PlanItem struct {

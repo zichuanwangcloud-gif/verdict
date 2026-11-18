@@ -20,6 +20,9 @@ const svc = computed(() => props.plan?.service || {})
       <Server /> 建议启动：<span class="mono">{{ svc.start_cmd }}</span>
       <span v-if="svc.health_url" class="mono muted">· {{ svc.health_url }}</span>
     </div>
+    <div v-if="plan.needs_service && svc.teardown_cmd" class="chip" style="align-self: flex-start">
+      <Server /> 收尾清理：<span class="mono">{{ svc.teardown_cmd }}</span>
+    </div>
     <div class="plan-items">
       <div v-for="it in plan.items" :key="it.id" class="plan-item">
         <div class="row" style="gap: 8px">
