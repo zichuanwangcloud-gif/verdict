@@ -15,6 +15,64 @@ type Result struct {
 	ACs      []protocol.ACResult `json:"acs"`
 	Findings []protocol.Finding  `json:"findings"`
 	Pages    []UIPage            `json:"pages"`
+	Coverage Coverage            `json:"coverage"`
+}
+
+// Coverage 描述这次测试实际达到的流程强度。
+type Coverage struct {
+	// Missing 是承诺了但没有成功的阶段角色。
+	Missing []string `json:"missing"`
+	// Degraded 表示强度不足，结论需要打折扣。
+	Degraded bool `json:"degraded"`
+	// Unjudged 表示缺少裁决步骤（最严格的一种降级）。
+	Unjudged bool   `json:"unjudged"`
+	Reason   string `json:"reason"`
+}
+
+var roleNames = map[string]string{RoleUI: "UI 走查", RoleRed: "红队质疑", RoleExplore: "主动探索", RoleJudge: "裁决"}
+
+// coverage 判断承诺的阶段是否都成功。任意一轮红队成功即算达成。
+func coverage(cfg Config, recs []StageRecord) Coverage {
+	var c Coverage
+	ok := func(role string) bool {
+		for _, r := range recs {
+			if r.Role == role && r.Status == StatusOK {
+				return true
+			}
+		}
+		return false
+	}
+	committed := func(role string) bool {
+		switch role {
+		case RoleUI:
+			return cfg.UI != UINone
+		case RoleRed:
+			return cfg.RedRounds > 0
+		case RoleExplore:
+			return cfg.Explore
+		case RoleJudge:
+			return cfg.Judge
+		}
+		return false
+	}
+	for _, role := range []string{RoleUI, RoleRed, RoleExplore, RoleJudge} {
+		if committed(role) && !ok(role) {
+			c.Missing = append(c.Missing, role)
+		}
+	}
+	if len(c.Missing) == 0 {
+		return c
+	}
+	c.Degraded = true
+	var names []string
+	for _, role := range c.Missing {
+		names = append(names, roleNames[role])
+		if role == RoleJudge {
+			c.Unjudged = true
+		}
+	}
+	c.Reason = "未达成：" + strings.Join(names, "、") + "（模型网关连续失败或重试次数用尽）"
+	return c
 }
 
 func (r Result) Verdict() string { return protocol.Report{ACs: r.ACs}.Verdict() }
@@ -215,6 +273,17 @@ func Consolidate(cfg Config, recs []StageRecord) Result {
 		}
 		res.Summary = fmt.Sprintf("共 %d 条验收标准：通过 %d，未通过 %d，无法验证 %d，存疑 %d。",
 			len(res.ACs), c[protocol.ACPass], c[protocol.ACFail], c[protocol.ACUnverifiable], c[protocol.ACDisputed])
+	}
+	res.Coverage = coverage(cfg, recs)
+	// 缺少裁决时结论不能签字：所有通过降为存疑。裁决是 A/S 档结论的最终来源。
+	if res.Coverage.Unjudged {
+		for i := range res.ACs {
+			if res.ACs[i].Status == protocol.ACPass {
+				res.ACs[i].Status = protocol.ACDisputed
+				res.ACs[i].Confidence = "low"
+				res.ACs[i].Reasoning = strings.TrimSpace(res.ACs[i].Reasoning + "\n（平台：裁决阶段没有完成，通过结论降为存疑）")
+			}
+		}
 	}
 	if res.ACs == nil {
 		res.ACs = []protocol.ACResult{}

@@ -3,7 +3,7 @@ import { ref, computed, onMounted, onUnmounted } from 'vue'
 import {
   ArrowLeft, RotateCcw, Square, GitBranch, GitCommitHorizontal, Server, Clock, Coins, ExternalLink,
   Sparkles, CircleCheck, CircleX, CircleHelp, Scale, ChevronRight, TriangleAlert, FileDiff, ScrollText,
-  MessageSquare, Send, Braces, Radio, Swords, Bug, Images, Workflow, Layers, Filter, ShieldCheck, Snowflake,
+  MessageSquare, Send, Braces, Radio, Swords, Bug, Images, Workflow, Layers, Filter, ShieldCheck, Snowflake, PlayCircle,
 } from 'lucide-vue-next'
 import { api } from '../api'
 import { go } from '../router'
@@ -23,6 +23,11 @@ const run = ref(null)
 const logs = ref([])
 const err = ref('')
 const actionErr = ref('')
+const canResume = computed(() => {
+  const r = run.value
+  if (!r || r.regression_id || r.status === 'canceled') return false
+  return r.status === 'error' || (r.status === 'completed' && r.coverage?.degraded)
+})
 const busy = ref(false)
 const closed = ref(new Set())
 const stageFilter = ref('')
@@ -114,6 +119,11 @@ async function addToBaseline() {
   })
 }
 
+async function resume() {
+  const r = await act(() => api.resumeRun(props.id))
+  if (r?.id) go('/runs/' + r.id)
+}
+
 async function writeBack() {
   const r = await act(() => api.writeBack(props.id))
   if (r) run.value = { ...run.value, ...r }
@@ -156,6 +166,7 @@ const legacySteps = computed(() => {
               <div class="row">
                 <button v-if="live" class="btn sm danger" :disabled="busy" @click="cancel"><Square :size="13" /> 取消</button>
                 <button v-if="run.status === 'completed' && run.verdict === 'pass' && run.issue_key !== 'MANUAL'" class="btn sm" :disabled="busy || addedToBaseline" @click="addToBaseline"><ShieldCheck :size="13" /> {{ addedToBaseline ? '已加入基线' : '加入回归基线' }}</button>
+                <button v-if="canResume" class="btn sm primary" :disabled="busy" @click="resume"><PlayCircle :size="13" /> 从失败处继续</button>
                 <button class="btn sm" :disabled="busy" @click="rerun"><RotateCcw :size="13" /> 重新测试</button>
               </div>
             </div>
@@ -183,6 +194,15 @@ const legacySteps = computed(() => {
 
       <div v-if="actionErr" class="alert bad">{{ actionErr }}</div>
       <div v-if="run.error" class="alert bad"><TriangleAlert :size="16" /><span class="body">{{ run.error }}</span></div>
+      <div v-if="run.coverage?.degraded" class="alert warn">
+        <TriangleAlert :size="16" />
+        <div class="stack" style="flex: 1">
+          <b>覆盖强度降级{{ run.coverage.unjudged ? '：结论未经裁决' : '' }}</b>
+          <span class="body">{{ run.coverage.reason }}</span>
+          <span class="hint">这是模型网关故障导致的，不代表这个档位的验收强度。可以点「从失败处继续」补跑缺失的阶段。</span>
+        </div>
+      </div>
+      <div v-if="run.parent_run_id" class="alert warn"><PlayCircle :size="16" /><span>这条测试续跑自 <a :href="'/runs/' + run.parent_run_id" @click.prevent="go('/runs/' + run.parent_run_id)">{{ run.parent_run_id }}</a>，已完成的阶段不会重跑。</span></div>
       <div v-if="run.findings?.some((f) => f.severity === 'critical' || f.severity === 'high')" class="alert bad">
         <Bug :size="16" />
         <span class="body">另外发现 {{ run.findings.filter((f) => f.severity === 'critical' || f.severity === 'high').length }} 个严重/高危问题（不影响验收结论），见下方「额外发现」。</span>

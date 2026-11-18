@@ -53,7 +53,9 @@ type Run struct {
 	PinSHA           string              `json:"pin_sha"`
 	PlanSource       string              `json:"plan_source"`
 	PresetPlan       string              `json:"-"`
+	Coverage         testplan.Coverage   `json:"coverage"`
 	Ports            []int               `json:"ports"`
+	ParentRunID      string              `json:"parent_run_id"`
 	Attempt          int                 `json:"attempt"`
 	CreatedAt        *time.Time          `json:"created_at"`
 	StartedAt        *time.Time          `json:"started_at"`
@@ -64,18 +66,18 @@ const runCols = `r.id, r.repo_id, p.url, p.name, p.ports, r.branch, r.commit_sha
  r.harness, r.tier, r.config, r.timeout_minutes, r.status, r.current_stage, r.verdict, r.summary, r.acs, r.findings, r.pages,
  r.approved, r.approval_note, r.awaiting_since, r.source_modified, r.diff, r.prompt, r.raw, r.cost_usd, r.error,
  r.linear_comment_url, r.linear_error, r.version_id, r.regression_id, r.case_id, r.pin_ref, r.pin_sha, r.plan_source,
- r.preset_plan, r.ports, r.attempt, r.created_at, r.started_at, r.finished_at
+ r.preset_plan, r.ports, r.parent_run_id, r.coverage, r.attempt, r.created_at, r.started_at, r.finished_at
  FROM runs r JOIN repos p ON p.id=r.repo_id JOIN runtimes t ON t.id=r.runtime_id`
 
 func scanRun(sc interface{ Scan(...any) error }) (Run, error) {
 	var r Run
-	var issue, cfg, acs, findings, pages, awaiting, ports, created, started, finished string
+	var issue, cfg, acs, findings, pages, awaiting, ports, cov, created, started, finished string
 	var modified, approved int
 	err := sc.Scan(&r.ID, &r.RepoID, &r.RepoURL, &r.RepoName, &r.RepoPorts, &r.Branch, &r.CommitSHA, &r.IssueKey, &issue, &r.RuntimeID,
 		&r.RuntimeName, &r.Harness, &r.Tier, &cfg, &r.TimeoutMinutes, &r.Status, &r.CurrentStage, &r.Verdict, &r.Summary,
 		&acs, &findings, &pages, &approved, &r.ApprovalNote, &awaiting, &modified, &r.Diff, &r.Prompt, &r.Raw, &r.CostUSD,
 		&r.Error, &r.LinearCommentURL, &r.LinearError, &r.VersionID, &r.RegressionID, &r.CaseID, &r.PinRef, &r.PinSHA,
-		&r.PlanSource, &r.PresetPlan, &ports, &r.Attempt, &created, &started, &finished)
+		&r.PlanSource, &r.PresetPlan, &ports, &r.ParentRunID, &cov, &r.Attempt, &created, &started, &finished)
 	if err != nil {
 		return r, err
 	}
@@ -93,6 +95,7 @@ func scanRun(sc interface{ Scan(...any) error }) (Run, error) {
 	if r.Pages == nil {
 		r.Pages = []testplan.UIPage{}
 	}
+	_ = json.Unmarshal([]byte(cov), &r.Coverage)
 	_ = json.Unmarshal([]byte(ports), &r.Ports)
 	if r.Ports == nil {
 		r.Ports = []int{}
@@ -121,6 +124,8 @@ type NewRun struct {
 	PlanSource   string
 	PresetPlan   string
 	Attempt      int
+	// ParentRunID 指向续跑来源的测试。
+	ParentRunID string
 }
 
 func (s *Store) CreateRun(ctx context.Context, n NewRun) (Run, error) {
@@ -138,10 +143,10 @@ type execer interface {
 func (s *Store) insertRun(ctx context.Context, db execer, n NewRun) (string, error) {
 	id := RandomHex(6)
 	_, err := db.ExecContext(ctx, `INSERT INTO runs(id, repo_id, branch, issue_key, issue, runtime_id, harness, tier, config, timeout_minutes, status, prompt,
- version_id, regression_id, case_id, pin_ref, pin_sha, plan_source, preset_plan, attempt, created_at)
- VALUES(?,?,?,?,?,?,?,?,?,?,?,'',?,?,?,?,?,?,?,?,?)`, id, n.RepoID, n.Branch, n.Issue.Identifier, toJSON(n.Issue), n.RuntimeID, n.Config.Harness,
+ version_id, regression_id, case_id, pin_ref, pin_sha, plan_source, preset_plan, parent_run_id, attempt, created_at)
+ VALUES(?,?,?,?,?,?,?,?,?,?,?,'',?,?,?,?,?,?,?,?,?,?)`, id, n.RepoID, n.Branch, n.Issue.Identifier, toJSON(n.Issue), n.RuntimeID, n.Config.Harness,
 		n.Config.Tier, toJSON(n.Config), n.Config.MaxMinutes, StatusQueued, n.VersionID, n.RegressionID, n.CaseID, n.PinRef, n.PinSHA,
-		n.PlanSource, n.PresetPlan, max(n.Attempt, 1), now())
+		n.PlanSource, n.PresetPlan, n.ParentRunID, max(n.Attempt, 1), now())
 	return id, err
 }
 
@@ -266,9 +271,38 @@ func (s *Store) SetCurrentStage(ctx context.Context, id, stage string) error {
 
 // SetResult 写入当前汇总结论（执行过程中随阶段更新）。
 func (s *Store) SetResult(ctx context.Context, id string, res testplan.Result, cost float64) error {
-	_, err := s.db.ExecContext(ctx, `UPDATE runs SET summary=?, acs=?, findings=?, pages=?, cost_usd=? WHERE id=?`,
-		res.Summary, toJSON(res.ACs), toJSON(res.Findings), toJSON(res.Pages), cost, id)
+	_, err := s.db.ExecContext(ctx, `UPDATE runs SET summary=?, acs=?, findings=?, pages=?, coverage=?, cost_usd=? WHERE id=?`,
+		res.Summary, toJSON(res.ACs), toJSON(res.Findings), toJSON(res.Pages), toJSON(res.Coverage), cost, id)
 	return err
+}
+
+// CopyStages 把已完成/跳过的阶段复制到新测试（续跑用），让流水线从失败处继续。
+func (s *Store) CopyStages(ctx context.Context, fromRun, toRun string) (int, error) {
+	src, err := s.Stages(ctx, fromRun)
+	if err != nil {
+		return 0, err
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+	n := 0
+	for _, st := range src {
+		if st.Status != testplan.StatusOK && st.Status != testplan.StatusSkipped {
+			continue
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO stages(id, run_id, seq, role, round, kind, harness, status, note, error, spec, output,
+ cost_usd, duration_ms, service, artifacts, attempt, created_at, started_at, finished_at)
+ VALUES(?, ?, (SELECT COALESCE(MAX(seq),0)+1 FROM stages WHERE run_id=?), ?, ?, ?, ?, ?, ?, '', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			toRun+"-"+RandomHex(3), toRun, toRun, st.Role, st.Round, st.Kind, st.Harness, st.Status, st.Note, toJSON(st.Spec),
+			string(st.Output), st.CostUSD, st.DurationMS, toJSON(st.Service), toJSON(st.Artifacts), st.Attempt,
+			now(), st.StartedAt, st.FinishedAt); err != nil {
+			return n, err
+		}
+		n++
+	}
+	return n, tx.Commit()
 }
 
 // SetVerdict 在进入收尾时写入最终结论。

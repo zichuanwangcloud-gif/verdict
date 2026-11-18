@@ -124,6 +124,10 @@ func CommentBody(run store.Run, stages []store.Stage, base string) string {
 	if severe > 0 {
 		fmt.Fprintf(&b, "> 🚨 另外发现 %d 个严重/高危问题（不影响验收结论），见下方「额外发现」。\n\n", severe)
 	}
+	if c := run.Coverage; c.Degraded {
+		fmt.Fprintf(&b, "> ⚠️ **覆盖强度降级**：%s。%s\n\n", mdCell(c.Reason),
+			map[bool]string{true: "结论未经裁决，不代表这个档位的验收强度。", false: ""}[c.Unjudged])
+	}
 
 	fmt.Fprintf(&b, "- 仓库：`%s` 分支 `%s`", run.RepoName, run.Branch)
 	if commit != "" {

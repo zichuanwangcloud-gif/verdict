@@ -90,6 +90,7 @@ export const api = {
   cancelRun: (id) => call('POST', `/runs/${id}/cancel`),
   approveRun: (id, note) => call('POST', `/runs/${id}/approve`, { note }),
   rerun: (id) => call('POST', `/runs/${id}/rerun`),
+  resumeRun: (id) => call('POST', `/runs/${id}/resume`),
   writeBack: (id) => call('POST', `/runs/${id}/linear`),
 }
 
