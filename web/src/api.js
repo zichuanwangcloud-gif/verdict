@@ -62,6 +62,7 @@ export const api = {
   deleteRepo: (id) => call('DELETE', `/repos/${id}`),
 
   issue: (key) => call('GET', `/issues/${encodeURIComponent(key)}`),
+  searchIssues: (q, limit = 20) => call('GET', `/issues?q=${encodeURIComponent(q)}&limit=${limit}`),
 
   runs: () => call('GET', '/runs'),
   createRun: (r) => call('POST', '/runs', r),

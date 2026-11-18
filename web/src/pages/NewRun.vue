@@ -1,10 +1,11 @@
 <script setup>
 import { ref, computed, onMounted, watch } from 'vue'
-import { ArrowLeft, Sparkles, FileText, PencilLine, GitBranch, Server, Bot, Play, Eye, MessageSquare, Timer, Layers, Swords, MonitorSmartphone, ShieldCheck, Gavel, Compass, ClipboardCheck, Coins, Container } from 'lucide-vue-next'
+import { ArrowLeft, Sparkles, FileText, PencilLine, GitBranch, Server, Bot, Play, MessageSquare, Timer, Layers, Swords, MonitorSmartphone, ShieldCheck, Gavel, Compass, ClipboardCheck, Coins, Container } from 'lucide-vue-next'
 import { tierMeta } from '../format'
 import { api } from '../api'
 import { go } from '../router'
 import HarnessLogo from '../components/HarnessLogo.vue'
+import IssuePicker from '../components/IssuePicker.vue'
 
 const repos = ref([])
 const runtimes = ref([])
@@ -75,6 +76,7 @@ const redInfo = computed(() => {
   const n = otherHarness.value === 'claude' ? 'Claude Code' : 'Codex'
   return h && h.installed && h.logged_in ? `红队：${n}（交叉模型）` : `红队：${n} 不可用，降级为同一模型新开会话`
 })
+const pickerOpen = ref(false)
 const browserWarn = computed(() => cfg.value?.ui && runtime.value?.info && !runtime.value.info.browser?.available)
 const harnessInfo = computed(() => runtime.value?.info?.harnesses || [])
 
@@ -103,6 +105,14 @@ async function doPreview() {
   } finally {
     previewing.value = false
   }
+}
+
+// 从下拉里选中时直接读详情
+function onPick(it) {
+  preview.value = null
+  previewErr.value = ''
+  if (!it) return
+  doPreview()
 }
 
 const canSubmit = computed(
@@ -152,7 +162,7 @@ async function submit() {
       </div>
     </div>
 
-    <section class="card stack" style="gap: 14px">
+    <section class="card stack" :class="{ 'z-top': pickerOpen }" style="gap: 14px">
       <div class="card-title"><FileText :size="16" /> 1 · 需求</div>
       <div class="choice-grid">
         <button type="button" class="choice" :class="{ selected: mode === 'linear' }" @click="mode = 'linear'">
@@ -173,13 +183,8 @@ async function submit() {
 
       <template v-if="mode === 'linear'">
         <div class="field">
-          <label>issue 编号</label>
-          <div class="input-group">
-            <input v-model="issueKey" placeholder="ENG-123" />
-            <button type="button" class="btn" :disabled="!issueKey.trim() || previewing" @click="doPreview">
-              <Eye :size="15" /> {{ previewing ? '读取中…' : '预览' }}
-            </button>
-          </div>
+          <label>issue</label>
+          <IssuePicker v-model="issueKey" @select="onPick" @open="pickerOpen = $event" />
         </div>
         <div v-if="previewErr" class="alert bad">{{ previewErr }}</div>
         <div v-if="preview" class="summary">
