@@ -6,11 +6,14 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"math/rand"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 
 	"verdict/internal/protocol"
@@ -48,6 +51,45 @@ func RepoKey(url string) string {
 		u = "repo"
 	}
 	return u
+}
+
+// repoLocks 按 bare 仓库路径加锁。同一仓库的多个测试会并发 fetch / worktree 操作，
+// git 自己用文件锁，直接并发会互相失败；这里在 agent 内先串行化。
+var repoLocks sync.Map // bare 路径 → *sync.Mutex
+
+func lockRepo(bare string) func() {
+	v, _ := repoLocks.LoadOrStore(bare, &sync.Mutex{})
+	mu := v.(*sync.Mutex)
+	mu.Lock()
+	return mu.Unlock
+}
+
+// isLockError 判断 git 是否因为并发锁而失败，这种情况适合退避重试。
+func isLockError(msg string) bool {
+	for _, k := range []string{"index.lock", "cannot lock ref", "Unable to create", "lock file", "shallow file has changed"} {
+		if strings.Contains(msg, k) {
+			return true
+		}
+	}
+	return false
+}
+
+// gitRetry 在 git 报锁冲突时退避重试，其它错误直接返回。
+func gitRetry(ctx context.Context, dir string, args ...string) (string, error) {
+	var out string
+	var err error
+	for i := range 3 {
+		out, err = git(ctx, dir, args...)
+		if err == nil || !isLockError(err.Error()) {
+			return out, err
+		}
+		select {
+		case <-ctx.Done():
+			return out, context.Cause(ctx)
+		case <-time.After(time.Duration(200+i*400+rand.Intn(300)) * time.Millisecond):
+		}
+	}
+	return out, err
 }
 
 func gitEnv() []string {
@@ -98,6 +140,10 @@ func (w Workspace) Prepare(ctx context.Context, runID, repoURL string, t Target,
 	}
 	key := RepoKey(repoURL)
 	bare := filepath.Join(w.reposDir(), key+".git")
+	// 同一仓库的准备流程整体串行：clone、fetch、worktree 都会写 bare 仓库的锁文件，
+	// 并发时（同仓库的多个测试）会互相失败。
+	unlock := lockRepo(bare)
+	defer unlock()
 	if _, err := os.Stat(bare); err != nil {
 		log("克隆仓库缓存 " + repoURL)
 		tmp := bare + ".partial"
@@ -119,11 +165,10 @@ func (w Workspace) Prepare(ctx context.Context, runID, repoURL string, t Target,
 		return nil, err
 	}
 	log("被测 commit " + sha)
-
 	dir := filepath.Join(w.runsDir(), runID)
 	_ = os.RemoveAll(dir)
-	_, _ = git(ctx, bare, "worktree", "prune")
-	if _, err := git(ctx, bare, "worktree", "add", "--detach", dir, sha); err != nil {
+	_, _ = gitRetry(ctx, bare, "worktree", "prune")
+	if _, err := gitRetry(ctx, bare, "worktree", "add", "--detach", dir, sha); err != nil {
 		return nil, err
 	}
 	p := &Prepared{Dir: dir, Commit: sha, bare: bare}
@@ -160,18 +205,24 @@ func (p *Prepared) Changes(ctx context.Context) (bool, string) {
 
 // Remove 删除 worktree。
 func (p *Prepared) Remove(ctx context.Context) {
-	if _, err := git(ctx, p.bare, "worktree", "remove", "--force", p.Dir); err != nil {
+	unlock := lockRepo(p.bare)
+	defer unlock()
+	if _, err := gitRetry(ctx, p.bare, "worktree", "remove", "--force", p.Dir); err != nil {
 		_ = os.RemoveAll(p.Dir)
-		_, _ = git(ctx, p.bare, "worktree", "prune")
+		_, _ = gitRetry(ctx, p.bare, "worktree", "prune")
 	}
 }
 
 // GC 清理超过 keep 的 worktree 与临时目录。
-func (w Workspace) GC(ctx context.Context, keep time.Duration, active string) {
+func (w Workspace) GC(ctx context.Context, keep time.Duration, active []string) {
+	skip := map[string]bool{}
+	for _, id := range active {
+		skip[id] = true
+	}
 	for _, d := range []string{w.runsDir(), filepath.Join(w.Root, "tmp")} {
 		ents, _ := os.ReadDir(d)
 		for _, e := range ents {
-			if e.Name() == active {
+			if skip[e.Name()] {
 				continue
 			}
 			info, err := e.Info()
@@ -314,4 +365,28 @@ func Resolve(ctx context.Context, m protocol.Resolve) protocol.Resolved {
 	}
 	out.Error = "远端没有分支或 tag：" + ref + "（如果是 commit，请填写完整的 40 位 SHA）"
 	return out
+}
+
+// freePorts 在本机挑选 n 个空闲端口：绑定 :0 让内核选，拿到后立即关闭。
+// 从关闭到被测进程真正监听之间有极短窗口，并发时同仓库的测试也不会用到同一个端口。
+func freePorts(n int) ([]int, error) {
+	if n <= 0 {
+		return nil, nil
+	}
+	out := make([]int, 0, n)
+	seen := map[int]bool{}
+	for len(out) < n {
+		l, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			return nil, err
+		}
+		p := l.Addr().(*net.TCPAddr).Port
+		l.Close()
+		if p < 1024 || seen[p] {
+			continue
+		}
+		seen[p] = true
+		out = append(out, p)
+	}
+	return out, nil
 }

@@ -51,6 +51,7 @@ export const api = {
   runtimes: () => call('GET', '/runtimes'),
   createRuntime: (name) => call('POST', '/runtimes', { name }),
   renameRuntime: (id, name) => call('PATCH', `/runtimes/${id}`, { name }),
+  setConcurrency: (id, concurrency) => call('PATCH', `/runtimes/${id}`, { concurrency }),
   deleteRuntime: (id) => call('DELETE', `/runtimes/${id}`),
   probeRuntime: (id) => call('POST', `/runtimes/${id}/probe`),
   rotateToken: (id) => call('POST', `/runtimes/${id}/token`),

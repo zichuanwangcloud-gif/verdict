@@ -27,6 +27,33 @@ const (
 
 var harnesses = []string{"claude", "codex"}
 
+// maxConcurrency 是并发度的硬上限，防止误填一个巨大值把机器打满。
+const maxConcurrency = 32
+
+// suggestConcurrency 按机器规模给出建议并发度：CPU 核数的一半、每 8GB 内存一个，取小的，夹在 [1, 8]。
+// 每个测试里都有模型子进程、构建和浏览器，不是纯 CPU 负载，所以不给满核数。
+func suggestConcurrency(info *protocol.HostInfo) int {
+	if info == nil || (info.CPU == 0 && info.MemTotalMB == 0) {
+		return 1
+	}
+	n := 8
+	if info.CPU > 0 {
+		n = min(n, max(info.CPU/2, 1))
+	}
+	if info.MemTotalMB > 0 {
+		n = min(n, max(info.MemTotalMB/8192, 1))
+	}
+	return max(1, n)
+}
+
+// effectiveConcurrency 是实际生效的并发度：用户设置优先，0 表示跟随建议值。
+func effectiveConcurrency(rt store.Runtime) int {
+	if rt.Concurrency > 0 {
+		return rt.Concurrency
+	}
+	return suggestConcurrency(rt.Info)
+}
+
 // LinearEndpoint 便于测试时替换 Linear API 地址，生产环境为空。
 var LinearEndpoint string
 
@@ -269,6 +296,10 @@ type runtimeView struct {
 	store.Runtime
 	// Outdated 表示 agent 协议版本与后端不一致，需要重新安装。
 	Outdated bool `json:"outdated"`
+	// EffectiveConcurrency 是实际使用的并发度（用户设置优先，0 时按机器算）。
+	EffectiveConcurrency int `json:"effective_concurrency"`
+	// SuggestedConcurrency 是按机器配置给出的建议值。
+	SuggestedConcurrency int `json:"suggested_concurrency"`
 }
 
 func (s *Server) listRuntimes(w http.ResponseWriter, r *http.Request) {
@@ -283,7 +314,8 @@ func (s *Server) listRuntimes(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		rt.Online = s.hub.Online(rt.ID)
-		out = append(out, runtimeView{Runtime: rt, Outdated: rt.Info != nil && rt.Info.Protocol != protocol.ProtocolVersion})
+		out = append(out, runtimeView{Runtime: rt, Outdated: rt.Info != nil && rt.Info.Protocol != protocol.ProtocolVersion,
+			EffectiveConcurrency: effectiveConcurrency(rt), SuggestedConcurrency: suggestConcurrency(rt.Info)})
 	}
 	ok(w, out)
 }
@@ -321,15 +353,34 @@ func (s *Server) renameRuntime(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var in struct {
-		Name string `json:"name"`
+		Name        *string `json:"name"`
+		Concurrency *int    `json:"concurrency"`
 	}
-	if err := decode(r, &in); err != nil || strings.TrimSpace(in.Name) == "" {
-		fail(w, http.StatusBadRequest, "名称不能为空")
+	if err := decode(r, &in); err != nil {
+		fail(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	if err := s.st.RenameRuntime(r.Context(), id, strings.TrimSpace(in.Name)); err != nil {
-		failErr(w, err)
-		return
+	if in.Name != nil {
+		if strings.TrimSpace(*in.Name) == "" {
+			fail(w, http.StatusBadRequest, "名称不能为空")
+			return
+		}
+		if err := s.st.RenameRuntime(r.Context(), id, strings.TrimSpace(*in.Name)); err != nil {
+			failErr(w, err)
+			return
+		}
+	}
+	if in.Concurrency != nil {
+		v := *in.Concurrency
+		if v < 0 || v > maxConcurrency {
+			fail(w, http.StatusBadRequest, fmt.Sprintf("并发度只能是 0（按机器自动）到 %d", maxConcurrency))
+			return
+		}
+		if err := s.st.SetConcurrency(r.Context(), id, v); err != nil {
+			failErr(w, err)
+			return
+		}
+		go s.hub.Schedule(id) // 调高后可能立刻有槽位
 	}
 	ok(w, map[string]bool{"ok": true})
 }
@@ -388,6 +439,8 @@ type repoInput struct {
 	StartCmd  string `json:"start_cmd"`
 	HealthURL string `json:"health_url"`
 	AppURL    string `json:"app_url"`
+	// Ports 是这个仓库的测试需要的端口数（0–8）。并发时需要给每个测试分配独立端口。
+	Ports int `json:"ports"`
 }
 
 func (in *repoInput) repo(id int64) (store.Repo, error) {
@@ -407,9 +460,12 @@ func (in *repoInput) repo(id int64) (store.Repo, error) {
 			return store.Repo{}, errors.New("健康检查地址和前端地址需要以 http:// 或 https:// 开头")
 		}
 	}
+	if in.Ports < 0 || in.Ports > 8 {
+		return store.Repo{}, errors.New("需要的端口数只能是 0 到 8")
+	}
 	return store.Repo{ID: id, URL: in.URL, Name: in.Name, TestNotes: in.TestNotes,
 		SetupCmd: strings.TrimSpace(in.SetupCmd), StartCmd: strings.TrimSpace(in.StartCmd),
-		HealthURL: strings.TrimSpace(in.HealthURL), AppURL: strings.TrimSpace(in.AppURL)}, nil
+		HealthURL: strings.TrimSpace(in.HealthURL), AppURL: strings.TrimSpace(in.AppURL), Ports: in.Ports}, nil
 }
 
 func repoName(url string) string {

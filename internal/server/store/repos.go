@@ -16,15 +16,16 @@ type Repo struct {
 	StartCmd  string     `json:"start_cmd"`
 	HealthURL string     `json:"health_url"`
 	AppURL    string     `json:"app_url"`
+	Ports     int        `json:"ports"`
 	CreatedAt *time.Time `json:"created_at"`
 }
 
-const repoCols = `id, url, name, test_notes, setup_cmd, start_cmd, health_url, app_url, created_at`
+const repoCols = `id, url, name, test_notes, setup_cmd, start_cmd, health_url, app_url, ports, created_at`
 
 func scanRepo(sc interface{ Scan(...any) error }) (Repo, error) {
 	var r Repo
 	var created string
-	err := sc.Scan(&r.ID, &r.URL, &r.Name, &r.TestNotes, &r.SetupCmd, &r.StartCmd, &r.HealthURL, &r.AppURL, &created)
+	err := sc.Scan(&r.ID, &r.URL, &r.Name, &r.TestNotes, &r.SetupCmd, &r.StartCmd, &r.HealthURL, &r.AppURL, &r.Ports, &created)
 	r.CreatedAt = parseTime(created)
 	return r, err
 }

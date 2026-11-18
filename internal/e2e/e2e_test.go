@@ -57,6 +57,9 @@ type fake struct {
 	log  []string // 执行过的角色
 	// serviceSeen 记录执行验证阶段时托管服务是否可访问
 	serviceSeen map[string]bool
+	// active / maxActive 记录同时执行的 harness 调用数，用于验证并发度。
+	active    int
+	maxActive int
 }
 
 func (f *fake) Name() string { return f.name }
@@ -74,7 +77,16 @@ func (f *fake) Run(ctx context.Context, spec harness.RunSpec) (harness.Output, e
 	r := role(spec.Prompt)
 	f.mu.Lock()
 	f.log = append(f.log, r)
+	f.active++
+	if f.active > f.maxActive {
+		f.maxActive = f.active
+	}
 	f.mu.Unlock()
+	defer func() {
+		f.mu.Lock()
+		f.active--
+		f.mu.Unlock()
+	}()
 	spec.Log("💬 fake " + f.name + " " + r)
 	if _, err := os.Stat(filepath.Join(spec.Dir, "feature.txt")); err != nil {
 		return harness.Output{}, fmt.Errorf("工作区里没有分支文件: %v", err)

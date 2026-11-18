@@ -1,6 +1,6 @@
 <script setup>
 import { ref, onMounted, onUnmounted } from 'vue'
-import { Plus, Server, RefreshCw, PencilLine, Trash2, Copy, Check, Terminal, ShieldAlert, X, Cpu, GitBranch, Container, Sparkles, MonitorSmartphone, KeyRound, ArrowUpCircle } from 'lucide-vue-next'
+import { Plus, Server, RefreshCw, PencilLine, Trash2, Copy, Check, Terminal, ShieldAlert, X, Cpu, GitBranch, Container, Sparkles, MonitorSmartphone, KeyRound, ArrowUpCircle, Gauge } from 'lucide-vue-next'
 import { api } from '../api'
 import { ago } from '../format'
 import HarnessLogo from '../components/HarnessLogo.vue'
@@ -79,6 +79,23 @@ async function rotate(rt, upgrade) {
     created.value = await api.rotateToken(rt.id)
     copied.value = false
     window.scrollTo({ top: 0, behavior: 'smooth' })
+    load()
+  } catch (e) {
+    err.value = e.message
+  }
+}
+
+async function editConcurrency(rt) {
+  const cur = rt.concurrency > 0 ? rt.concurrency : ''
+  const v = prompt(`「${rt.name}」的并发度（同时跑几个测试，1–32）。留空表示按机器自动（建议 ${rt.suggested_concurrency}）。`, cur)
+  if (v === null) return
+  const n = v.trim() === '' ? 0 : Number(v)
+  if (!Number.isInteger(n) || n < 0 || n > 32) {
+    err.value = '并发度必须是 0（自动）到 32 之间的整数'
+    return
+  }
+  try {
+    await api.setConcurrency(rt.id, n)
     load()
   } catch (e) {
     err.value = e.message
@@ -172,6 +189,7 @@ function hState(h) {
             </div>
           </div>
           <div class="row" style="gap: 2px">
+            <button class="btn ghost icon" title="设置并发度" @click="editConcurrency(rt)"><Gauge :size="15" /></button>
             <button class="btn ghost icon" title="重新探测" :disabled="!rt.online" @click="probe(rt)">
               <RefreshCw :size="15" :class="{ spin: probing.has(rt.id) }" />
             </button>
@@ -194,6 +212,11 @@ function hState(h) {
             <span v-if="rt.info.git" class="chip"><GitBranch /> git {{ rt.info.git }}</span>
             <span v-if="rt.info.docker" class="chip"><Container /> docker</span>
             <span class="chip mono">agent {{ rt.info.agent_version }}</span>
+            <span v-if="rt.info.cpu" class="chip"><Cpu /> {{ rt.info.cpu }} 核<template v-if="rt.info.mem_total_mb"> · {{ Math.round(rt.info.mem_total_mb / 1024) }}GB</template></span>
+            <button class="chip" :title="rt.concurrency > 0 ? '手动设置（点击修改）' : '按机器自动（点击修改）'" @click="editConcurrency(rt)" style="cursor: pointer">
+              <Gauge /> 并发 {{ rt.effective_concurrency }}<template v-if="rt.info.busy"> · 忙 {{ rt.info.busy }}</template>
+              <span v-if="!rt.concurrency" class="muted">（自动）</span>
+            </button>
           </div>
           <div class="stack" style="gap: 8px">
             <div v-for="h in rt.info.harnesses" :key="h.name" class="harness-row">
