@@ -14,6 +14,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -38,6 +39,27 @@ type Client struct {
 	APIKey   string
 	Endpoint string // 测试时可替换
 	HTTP     *http.Client
+
+	viewerOnce sync.Once
+	viewerID   string
+	viewerErr  error
+}
+
+// MyID 返回 API Key 所属账号的 user id（用于判断 issue 是否分配给我），结果会被缓存。
+func (c *Client) MyID(ctx context.Context) (string, error) {
+	c.viewerOnce.Do(func() {
+		var out struct {
+			Viewer struct {
+				ID string `json:"id"`
+			} `json:"viewer"`
+		}
+		if err := c.do(ctx, `query { viewer { id } }`, nil, &out); err != nil {
+			c.viewerErr = err
+			return
+		}
+		c.viewerID = out.Viewer.ID
+	})
+	return c.viewerID, c.viewerErr
 }
 
 func New(key string) *Client {
@@ -91,6 +113,9 @@ type IssueSummary struct {
 	State      string `json:"state"`
 	Team       string `json:"team"`
 	Assignee   string `json:"assignee"`
+	// AssigneeID 是负责人的 user id；Mine 表示是否分配给我（API Key 所属账号）。
+	AssigneeID string `json:"-"`
+	Mine       bool   `json:"mine"`
 	UpdatedAt  string `json:"updated_at"`
 	URL        string `json:"url"`
 }
@@ -100,17 +125,33 @@ const searchCap = 50
 
 var identifierRe = regexp.MustCompile(`^([A-Za-z][A-Za-z0-9]*)-(\d*)$`)
 
-// SearchIssues 按关键字搜索 issue。query 为空时返回最近更新的 issue。
+// SearchIssues 搜索 issue。
 //
-// Linear 的 IssueFilter 不支持按 identifier 过滤，searchIssues 又是模糊语义搜索（输入 ENG-1
-// 第一条可能毫不相关）。所以这里组合两种查询，再在本地按编号精确排序：
-//   - 像编号的输入（ENG-142 / ENG-1）→ 团队 key + 编号范围过滤，拿到同团队的全部候选后在本地筛前缀；
-//   - 其他输入 → 标题包含匹配 + 全文搜索，按最近更新合并。
+//   - query 为空：只返回分配给我（API Key 所属账号）的 issue，按最近更新排序——点开下拉时的默认列表。
+//   - query 非空：搜索全部 issue（编号、标题、全文），分配给我的排在前面。
+//
+// Linear 的 IssueFilter 不支持按 identifier 过滤，searchIssues 又是模糊语义搜索，所以按输入形态组合查询，
+// 再在本地合并、排序：分配给我 > 编号完全一致 > 编号前缀匹配 > 其余（最近更新）。
 func (c *Client) SearchIssues(ctx context.Context, query string, limit int) ([]IssueSummary, error) {
 	if limit <= 0 || limit > searchCap {
 		limit = searchCap
 	}
 	query = strings.TrimSpace(query)
+
+	myID, err := c.MyID(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	if query == "" {
+		list, err := c.listIssues(ctx, map[string]any{"assignee": map[string]any{"isMe": map[string]any{"eq": true}}}, limit)
+		if err != nil {
+			return nil, err
+		}
+		markMine(list, myID)
+		return capList(sortIssues(list, "", myID), limit), nil
+	}
+
 	cands := map[string]IssueSummary{}
 	add := func(list []IssueSummary) {
 		for _, s := range list {
@@ -118,14 +159,6 @@ func (c *Client) SearchIssues(ctx context.Context, query string, limit int) ([]I
 				cands[s.Identifier] = s
 			}
 		}
-	}
-
-	if query == "" {
-		list, err := c.listIssues(ctx, nil, limit)
-		if err != nil {
-			return nil, err
-		}
-		return capList(rank(list, ""), limit), nil
 	}
 
 	if m := identifierRe.FindStringSubmatch(query); m != nil {
@@ -169,35 +202,26 @@ func (c *Client) SearchIssues(ctx context.Context, query string, limit int) ([]I
 	for _, s := range cands {
 		out = append(out, s)
 	}
-	return capList(rank(out, query), limit), nil
+	markMine(out, myID)
+	return capList(sortIssues(out, query, myID), limit), nil
 }
 
-// numberPrefixRanges 把数字前缀展开成若干闭区间。前缀匹配的编号是
-// 14、140-149、1400-1499……，不是一段连续区间，所以要展开：
-// "1" → [1,1] [10,19] [100,199]…，"14" → [14,14] [140,149] [1400,1499]…
-func numberPrefixRanges(digits string) []any {
-	const maxDigits = 7 // 超过这个位数就不做前缀展开（量级不现实，也避免过多区间）
-	lo, err := strconv.Atoi(digits)
-	if err != nil || lo < 0 {
-		return nil
+func markMine(list []IssueSummary, myID string) {
+	if myID == "" {
+		return
 	}
-	var out []any
-	span := 1
-	for i := 0; i < maxDigits; i++ {
-		out = append(out, map[string]any{"number": map[string]any{"gte": lo, "lte": lo + span - 1}})
-		lo *= 10
-		span *= 10
-		if lo > 100_000_000 {
-			break
-		}
+	for i := range list {
+		list[i].Mine = list[i].AssigneeID == myID
 	}
-	return out
 }
 
-// rank 让编号完全匹配、其次编号以关键字开头的排前面，其余按最近更新。
-func rank(list []IssueSummary, query string) []IssueSummary {
+// sortIssues 排序：分配给我的在前，其次编号完全一致、编号前缀匹配，最后按最近更新。
+func sortIssues(list []IssueSummary, query, myID string) []IssueSummary {
 	up := strings.ToUpper(strings.TrimSpace(query))
 	sort.SliceStable(list, func(i, j int) bool {
+		if list[i].Mine != list[j].Mine {
+			return list[i].Mine
+		}
 		ri, rj := 3, 3
 		if up != "" {
 			ri, rj = idRank(list[i].Identifier, up), idRank(list[j].Identifier, up)
@@ -228,6 +252,28 @@ func capList(list []IssueSummary, n int) []IssueSummary {
 	return list
 }
 
+// numberPrefixRanges 把数字前缀展开成若干闭区间。前缀匹配的编号是
+// 14、140-149、1400-1499……，不是一段连续区间，所以要展开：
+// "1" → [1,1] [10,19] [100,199]…，"14" → [14,14] [140,149] [1400,1499]…
+func numberPrefixRanges(digits string) []any {
+	const maxDigits = 7 // 超过这个位数就不做前缀展开（量级不现实，也避免过多区间）
+	lo, err := strconv.Atoi(digits)
+	if err != nil || lo < 0 {
+		return nil
+	}
+	var out []any
+	span := 1
+	for i := 0; i < maxDigits; i++ {
+		out = append(out, map[string]any{"number": map[string]any{"gte": lo, "lte": lo + span - 1}})
+		lo *= 10
+		span *= 10
+		if lo > 100_000_000 {
+			break
+		}
+	}
+	return out
+}
+
 type issueNode = struct {
 	ID         string `json:"id"`
 	Identifier string `json:"identifier"`
@@ -242,6 +288,7 @@ type issueNode = struct {
 		Key  string `json:"key"`
 	} `json:"team"`
 	Assignee *struct {
+		ID          string `json:"id"`
 		DisplayName string `json:"displayName"`
 	} `json:"assignee"`
 }
@@ -255,7 +302,7 @@ func toSummary(n issueNode) IssueSummary {
 		s.Team = n.Team.Name
 	}
 	if n.Assignee != nil {
-		s.Assignee = n.Assignee.DisplayName
+		s.Assignee, s.AssigneeID = n.Assignee.DisplayName, n.Assignee.ID
 	}
 	return s
 }
@@ -264,7 +311,7 @@ func toSummary(n issueNode) IssueSummary {
 func (c *Client) listIssues(ctx context.Context, filter map[string]any, limit int) ([]IssueSummary, error) {
 	const q = `query($filter: IssueFilter, $first: Int) {
   issues(filter: $filter, first: $first, orderBy: updatedAt) {
-    nodes { id identifier title url updatedAt state { name } team { name key } assignee { displayName } }
+    nodes { id identifier title url updatedAt state { name } team { name key } assignee { id displayName } }
   }
 }`
 	var out struct {
@@ -286,7 +333,7 @@ func (c *Client) listIssues(ctx context.Context, filter map[string]any, limit in
 func (c *Client) searchIssues(ctx context.Context, term string, limit int) ([]IssueSummary, error) {
 	const q = `query($term: String!, $first: Int) {
   searchIssues(term: $term, first: $first) {
-    nodes { id identifier title url updatedAt state { name } team { name key } assignee { displayName } }
+    nodes { id identifier title url updatedAt state { name } team { name key } assignee { id displayName } }
   }
 }`
 	var out struct {

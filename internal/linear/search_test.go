@@ -14,6 +14,7 @@ import (
 // fake 同时处理 issues(filter:) 和 searchIssues(term:)。
 // handler 里不直接调 t.Errorf（那会在响应写到一半时中断连接），问题记在 errs 里，请求结束后再断言。
 type fake struct {
+	myID     string
 	calls    []map[string]any
 	errs     []string
 	issuesFn func(filter map[string]any) []string
@@ -23,10 +24,15 @@ type fake struct {
 func bad(f *fake, format string, args ...any) { f.errs = append(f.errs, fmt.Sprintf(format, args...)) }
 
 // node 生成一条 issue；state / assignee 为空时返回 null。
+// assignee 形如 "王小明" 或 "王小明@u-me"（@ 后面是 user id）。
 func node(id, title, updated, state, assignee string) string {
 	a := "null"
 	if assignee != "" {
-		a = `{"displayName":"` + assignee + `"}`
+		name, uid, _ := strings.Cut(assignee, "@")
+		if uid == "" {
+			uid = "u-" + name
+		}
+		a = `{"id":"` + uid + `","displayName":"` + name + `"}`
 	}
 	st := "null"
 	if state != "" {
@@ -44,6 +50,10 @@ func (f *fake) client(t *testing.T) *Client {
 			Variables map[string]any `json:"variables"`
 		}
 		json.NewDecoder(r.Body).Decode(&body)
+		if strings.Contains(body.Query, "viewer") {
+			io.WriteString(w, `{"data":{"viewer":{"id":"`+f.myID+`"}}}`)
+			return
+		}
 		f.calls = append(f.calls, body.Variables)
 		var nodes []string
 		if strings.Contains(body.Query, "searchIssues") {
@@ -60,6 +70,9 @@ func (f *fake) client(t *testing.T) *Client {
 		io.WriteString(w, `{"data":{"issues":{"nodes":[`+strings.Join(nodes, ",")+`]},"searchIssues":{"nodes":[`+strings.Join(nodes, ",")+`]}}}`)
 	}))
 	t.Cleanup(ts.Close)
+	if f.myID == "" {
+		f.myID = "u-me"
+	}
 	c := New("k")
 	c.Endpoint = ts.URL
 	return c
@@ -76,10 +89,11 @@ func ids(list []IssueSummary) []string {
 func TestSearchEmpty(t *testing.T) {
 	f := &fake{}
 	f.issuesFn = func(flt map[string]any) []string {
-		if flt != nil {
-			bad(f, "空关键字不应带 filter: %v", flt)
+		// 只应返回分给我的 issue
+		if asg := flt["assignee"].(map[string]any)["isMe"].(map[string]any)["eq"]; asg != true {
+			bad(f, "默认列表应只查分配给我的 issue: %v", flt)
 		}
-		return []string{node("ENG-142", "购物车", "2026-11-15", "In Progress", "王小明"), node("ENG-120", "登录", "2026-11-10", "Done", "")}
+		return []string{node("ENG-142", "购物车", "2026-11-15", "In Progress", "王小明@u-me"), node("ENG-120", "登录", "2026-11-10", "Done", "")}
 	}
 	list, err := f.client(t).SearchIssues(context.Background(), "  ", 10)
 	if err != nil {
@@ -90,6 +104,9 @@ func TestSearchEmpty(t *testing.T) {
 	}
 	if len(list) != 2 || list[0].Identifier != "ENG-142" || list[0].Assignee != "王小明" || list[0].Team != "工程" || list[0].State != "In Progress" {
 		t.Fatalf("解析或排序不对: %+v", list)
+	}
+	if !list[0].Mine || list[1].Mine {
+		t.Fatalf("应标出哪些是分给我的: %+v", list)
 	}
 }
 
