@@ -8,6 +8,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"runtime/debug"
 	"sync"
 	"time"
 
@@ -149,6 +150,7 @@ func (a *Agent) onStage(m protocol.Stage) {
 		s.mu.Unlock()
 		return // 收尾中，或正在执行（同一阶段的重发，或后端异常的并发派发）
 	}
+	t0 := time.Now()
 	timeout := time.Duration(max(m.TimeoutMinutes, 1)) * time.Minute
 	ctx, cancel := context.WithCancelCause(s.ctx)
 	ctx, cancelTimeout := context.WithTimeoutCause(ctx, timeout, stageTimeoutError{timeout})
@@ -157,18 +159,26 @@ func (a *Agent) onStage(m protocol.Stage) {
 	s.mu.Unlock()
 
 	go func() {
+		var res protocol.StageResult
 		defer func() {
+			// 阶段里的任何 panic 都只让这个阶段失败，不能把整个 agent 带走——
+			// agent 一崩，这台机器上其他正在跑的测试会被一起中断。
+			if r := recover(); r != nil {
+				res = protocol.StageResult{Status: protocol.StageError,
+					Error: fmt.Sprintf("阶段执行时 agent 内部错误：%v", r), DurationMS: time.Since(t0).Milliseconds()}
+				log.Printf("测试 %s 阶段 %s（%s）panic: %v\n%s", s.runID, m.StageID, m.Role, r, debug.Stack())
+			}
 			cancelTimeout()
 			cancel(nil)
 			s.mu.Lock()
 			s.stageID, s.stageCancel, s.stageDone = "", nil, nil
 			s.mu.Unlock()
+			a.emit(protocol.Event{RunID: s.runID, Kind: protocol.KindStageResult, StageID: m.StageID, Stage: &res})
+			log.Printf("测试 %s 阶段 %s（%s）结束：%s %s", s.runID, m.StageID, m.Role, res.Status, res.Error)
 			close(done)
 		}()
 		<-s.ready
-		res := a.runStage(ctx, s, m)
-		a.emit(protocol.Event{RunID: s.runID, Kind: protocol.KindStageResult, StageID: m.StageID, Stage: &res})
-		log.Printf("测试 %s 阶段 %s（%s）结束：%s %s", s.runID, m.StageID, m.Role, res.Status, res.Error)
+		res = a.runStage(ctx, s, m)
 	}()
 }
 
