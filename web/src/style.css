@@ -706,3 +706,29 @@ details[open] > summary { margin-bottom: 12px; }
   .tier-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .duel-round { grid-template-columns: 1fr; }
 }
+
+/* ---------- issue 搜索选择 ---------- */
+.ip { position: relative; }
+.ip-field { display: flex; align-items: center; gap: 8px; padding: 0 10px; border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--code-bg); transition: border-color .15s, box-shadow .15s; }
+.ip-field.open { border-color: var(--violet); box-shadow: 0 0 0 3px rgba(167, 139, 250, 0.18); }
+.ip-icon { color: var(--muted); flex: none; }
+.ip-field input.ip-input { flex: 1; border: none; background: none; box-shadow: none; padding: 9px 0; }
+.ip-field input.ip-input:focus { box-shadow: none; }
+.ip-clear { border: none; background: none; color: var(--muted); cursor: pointer; padding: 2px; display: grid; place-items: center; }
+.ip-clear:hover { color: var(--text); }
+.ip-pop { position: absolute; z-index: 30; top: calc(100% + 6px); left: 0; right: 0; max-height: 340px; overflow: auto; padding: 6px; border-radius: var(--radius); border: 1px solid var(--border-strong); background: var(--surface-solid); box-shadow: 0 24px 60px -18px rgba(0, 0, 0, .7); }
+.ip-hint { display: flex; align-items: center; gap: 6px; font-size: 11.5px; color: var(--muted); padding: 6px 8px; }
+.ip-item { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: center; gap: 10px; width: 100%; text-align: left; padding: 8px 10px; border: none; border-radius: var(--radius-sm); background: none; color: var(--text); font: inherit; cursor: pointer; }
+.ip-item.active { background: var(--grad-soft); }
+.ip-id { color: var(--violet); font-size: 12px; white-space: nowrap; }
+.ip-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13.5px; }
+.ip-meta { display: flex; align-items: center; gap: 8px; font-size: 11.5px; white-space: nowrap; }
+.ip-err { padding: 8px 10px; color: var(--bad); font-size: 12.5px; }
+.ip-foot { display: flex; align-items: center; gap: 5px; padding: 6px 10px 2px; margin-top: 4px; border-top: 1px solid var(--border); font-size: 11px; color: var(--muted); }
+@media (max-width: 640px) {
+  .ip-item { grid-template-columns: auto minmax(0, 1fr); }
+  .ip-meta { display: none; }
+}
+.ip-empty { display: flex; flex-direction: column; align-items: center; gap: 6px; padding: 22px 12px; color: var(--muted); font-size: 12.5px; text-align: center; }
+/* 卡片有 backdrop-filter，各自形成层叠上下文；下拉展开时把所在卡片提到上层 */
+.card.z-top { position: relative; z-index: 20; }

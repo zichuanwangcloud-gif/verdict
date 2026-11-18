@@ -77,6 +77,7 @@ func (s *Server) Handler() http.Handler {
 	api.HandleFunc("PUT /api/repos/{id}", s.updateRepo)
 	api.HandleFunc("DELETE /api/repos/{id}", s.deleteRepo)
 
+	api.HandleFunc("GET /api/issues", s.searchIssues)
 	api.HandleFunc("GET /api/issues/{key}", s.previewIssue)
 
 	api.HandleFunc("GET /api/runs", s.listRuns)
@@ -463,6 +464,23 @@ func (s *Server) deleteRepo(w http.ResponseWriter, r *http.Request) {
 }
 
 // ---- issues ----
+
+// searchIssues 关键字搜索 issue；q 为空时返回最近更新的 issue。
+func (s *Server) searchIssues(w http.ResponseWriter, r *http.Request) {
+	q := strings.TrimSpace(r.URL.Query().Get("q"))
+	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
+	key := s.linearKey(r.Context())
+	if key == "" {
+		fail(w, http.StatusBadRequest, "尚未配置 Linear API Key，请先在「设置」里填写，或改用手动输入需求")
+		return
+	}
+	list, err := linear.New(key).SearchIssues(r.Context(), q, limit)
+	if err != nil {
+		fail(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	ok(w, list)
+}
 
 func (s *Server) previewIssue(w http.ResponseWriter, r *http.Request) {
 	is, err := linear.New(s.linearKey(r.Context())).GetIssue(r.Context(), strings.TrimSpace(r.PathValue("key")))
