@@ -83,6 +83,19 @@ export const api = {
   issue: (key) => call('GET', `/issues/${encodeURIComponent(key)}`),
   searchIssues: (q, limit = 20) => call('GET', `/issues?q=${encodeURIComponent(q)}&limit=${limit}`),
 
+  boardTeams: () => call('GET', '/board/teams'),
+  boardIssues: ({ team = '', states = [], assignee = 'all', q = '', repoId = 0, limit = 100 } = {}) => {
+    const p = new URLSearchParams()
+    if (team) p.set('team', team)
+    if (states.length) p.set('states', states.join(','))
+    if (assignee) p.set('assignee', assignee)
+    if (q) p.set('q', q)
+    if (repoId) p.set('repo_id', repoId)
+    p.set('limit', limit)
+    return call('GET', '/board/issues?' + p.toString())
+  },
+  startBatchRuns: (body) => call('POST', '/board/runs', body),
+
   runs: () => call('GET', '/runs'),
   createRun: (r) => call('POST', '/runs', r),
   run: (id) => call('GET', `/runs/${id}`),

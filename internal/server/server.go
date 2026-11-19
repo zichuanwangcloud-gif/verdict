@@ -23,6 +23,8 @@ import (
 const (
 	settingLinearKey = "linear_api_key"
 	settingPublicURL = "public_url"
+	// settingBoardDefaults 记住 Linear 列表页顶部的统一配置（仓库 / 分支 / 档位 / 运行时 / harness / 筛选）。
+	settingBoardDefaults = "board_defaults"
 	// SettingStageRetries / SettingRetryDelay 是阶段重试设置，页面「设置」可改。
 	SettingStageRetries = "stage_retries"
 	SettingRetryDelay   = "stage_retry_delay_seconds"
@@ -117,6 +119,9 @@ func (s *Server) Handler() http.Handler {
 
 	api.HandleFunc("GET /api/issues", s.searchIssues)
 	api.HandleFunc("GET /api/issues/{key}", s.previewIssue)
+	api.HandleFunc("GET /api/board/issues", s.issueBoard)
+	api.HandleFunc("GET /api/board/teams", s.listIssueTeams)
+	api.HandleFunc("POST /api/board/runs", s.startBatchRuns)
 
 	api.HandleFunc("GET /api/versions", s.listVersions)
 	api.HandleFunc("POST /api/versions", s.createVersion)
@@ -273,6 +278,7 @@ func (s *Server) getSettings(w http.ResponseWriter, r *http.Request) {
 	retries, _ := s.st.Setting(r.Context(), SettingStageRetries)
 	delay, _ := s.st.Setting(r.Context(), SettingRetryDelay)
 	ok(w, map[string]any{
+		"board_defaults":        s.boardDefaults(r.Context()),
 		"linear_api_key_masked": masked,
 		"public_url":            pub,
 		"public_url_effective":  s.publicURL(r.Context(), r),
@@ -287,6 +293,8 @@ func (s *Server) putSettings(w http.ResponseWriter, r *http.Request) {
 		PublicURL    *string `json:"public_url"`
 		StageRetries *int    `json:"stage_retries"`
 		RetryDelay   *int    `json:"stage_retry_delay"` // 秒
+		// BoardDefaults 是 Linear 列表页顶部的统一配置，整块覆盖。
+		BoardDefaults *boardDefaults `json:"board_defaults"`
 	}
 	if err := decode(r, &in); err != nil {
 		fail(w, http.StatusBadRequest, err.Error())
@@ -314,6 +322,17 @@ func (s *Server) putSettings(w http.ResponseWriter, r *http.Request) {
 	}
 	if in.PublicURL != nil {
 		if err := s.st.SetSetting(r.Context(), settingPublicURL, strings.TrimRight(strings.TrimSpace(*in.PublicURL), "/")); err != nil {
+			failErr(w, err)
+			return
+		}
+	}
+	if in.BoardDefaults != nil {
+		raw, err := json.Marshal(in.BoardDefaults)
+		if err != nil {
+			fail(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		if err := s.st.SetSetting(r.Context(), settingBoardDefaults, string(raw)); err != nil {
 			failErr(w, err)
 			return
 		}
