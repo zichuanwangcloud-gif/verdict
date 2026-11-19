@@ -1,6 +1,6 @@
 <script setup>
 import { computed } from 'vue'
-import { FlaskConical, Server, GitBranch, Settings as SettingsIcon, LogOut, Sun, Moon, ScanSearch, PackageCheck, ShieldCheck } from 'lucide-vue-next'
+import { FlaskConical, Server, GitBranch, Settings as SettingsIcon, LogOut, Sun, Moon, ScanSearch, PackageCheck, ShieldCheck, Inbox } from 'lucide-vue-next'
 import { auth, setToken } from './api'
 import { route, go, match } from './router'
 import { theme, toggleTheme } from './theme'
@@ -14,8 +14,10 @@ import Settings from './pages/Settings.vue'
 import Versions from './pages/Versions.vue'
 import VersionDetail from './pages/VersionDetail.vue'
 import Cases from './pages/Cases.vue'
+import Board from './pages/Board.vue'
 
 const tabs = [
+  { path: '/board', label: '待测试', icon: Inbox },
   { path: '/runs', label: '验收测试', icon: FlaskConical },
   { path: '/versions', label: '版本', icon: PackageCheck },
   { path: '/cases', label: '回归基线', icon: ShieldCheck },
@@ -25,6 +27,7 @@ const tabs = [
 ]
 
 const view = computed(() => {
+  if (match('/board')) return { comp: Board, props: {} }
   if (match('/runs/new')) return { comp: NewRun, props: {} }
   const r = match('/runs/:id')
   if (r) return { comp: RunDetail, props: { id: r.id } }

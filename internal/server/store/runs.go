@@ -351,3 +351,88 @@ func (s *Store) SetLinearResult(ctx context.Context, id, url, errMsg string) err
 	_, err := s.db.ExecContext(ctx, `UPDATE runs SET linear_comment_url=?, linear_error=? WHERE id=?`, url, errMsg, id)
 	return err
 }
+
+// IssueRunBrief 是某个 issue 最近一次测试的摘要，供 Linear 列表页显示状态。
+type IssueRunBrief struct {
+	IssueKey   string              `json:"issue_key"`
+	RunID      string              `json:"run_id"`
+	Status     string              `json:"status"`
+	Verdict    string              `json:"verdict"`
+	Summary    string              `json:"summary"`
+	Error      string              `json:"error"`
+	Branch     string              `json:"branch"`
+	CommitSHA  string              `json:"commit_sha"`
+	ACs        []protocol.ACResult `json:"acs"`
+	CreatedAt  *time.Time          `json:"created_at"`
+	FinishedAt *time.Time          `json:"finished_at"`
+}
+
+// LastRunsByIssue 返回这些 issue 在指定仓库上最近的一次测试（不含回归子测试）。
+// repoID 为 0 时跨仓库取最近一次。没有测试记录的 issue 不出现在结果里。
+func (s *Store) LastRunsByIssue(ctx context.Context, repoID int64, issueKeys []string) (map[string]IssueRunBrief, error) {
+	out := map[string]IssueRunBrief{}
+	if len(issueKeys) == 0 {
+		return out, nil
+	}
+	ph, args := placeholders(issueKeys)
+	q := `SELECT r.issue_key, r.id, r.status, r.verdict, r.summary, r.error, r.branch, r.commit_sha, r.acs, r.created_at, r.finished_at
+ FROM runs r WHERE r.issue_key IN (` + ph + `) AND r.regression_id=''`
+	if repoID > 0 {
+		q += ` AND r.repo_id=?`
+		args = append(args, repoID)
+	}
+	// 每个 issue 取最新一条：按创建时间、再按 rowid 兜底（同一秒创建的按写入顺序）。
+	q += ` ORDER BY r.issue_key, r.created_at DESC, r.rowid DESC`
+	rows, err := s.db.QueryContext(ctx, q, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var b IssueRunBrief
+		var acs, created, finished string
+		if err := rows.Scan(&b.IssueKey, &b.RunID, &b.Status, &b.Verdict, &b.Summary, &b.Error, &b.Branch, &b.CommitSHA,
+			&acs, &created, &finished); err != nil {
+			return nil, err
+		}
+		if _, seen := out[b.IssueKey]; seen {
+			continue // 已经拿到更新的一条
+		}
+		_ = json.Unmarshal([]byte(acs), &b.ACs)
+		// 列表只需要条数与结论，不带证据正文。
+		for i := range b.ACs {
+			b.ACs[i].Evidence, b.ACs[i].Reasoning, b.ACs[i].Challenges = "", "", nil
+		}
+		b.CreatedAt, b.FinishedAt = parseTime(created), parseTime(finished)
+		out[b.IssueKey] = b
+	}
+	return out, rows.Err()
+}
+
+// ActiveRunsByIssue 返回某仓库上排队或执行中的 issue → run id。
+// 批量启动前用它跳过已经在跑或排队的 issue，重复点击不会重复排队。
+func (s *Store) ActiveRunsByIssue(ctx context.Context, repoID int64) (map[string]string, error) {
+	ph, args := placeholders(ActiveStatuses)
+	q := `SELECT r.issue_key, r.id FROM runs r WHERE r.status IN (` + ph + `)`
+	if repoID > 0 {
+		q += ` AND r.repo_id=?`
+		args = append(args, repoID)
+	}
+	q += ` ORDER BY r.created_at, r.rowid`
+	rows, err := s.db.QueryContext(ctx, q, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string]string{}
+	for rows.Next() {
+		var key, id string
+		if err := rows.Scan(&key, &id); err != nil {
+			return nil, err
+		}
+		if _, seen := out[key]; !seen {
+			out[key] = id
+		}
+	}
+	return out, rows.Err()
+}
