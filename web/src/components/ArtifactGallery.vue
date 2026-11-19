@@ -3,7 +3,12 @@ import { ref, watchEffect } from 'vue'
 import { ImageOff, X } from 'lucide-vue-next'
 import { artifactURL } from '../api'
 
-const props = defineProps({ runId: String, artifacts: Array })
+const props = defineProps({
+  runId: String,
+  artifacts: Array,
+  // issues：文件名 → 不可用原因（来自截图质检、机器体检或 UI 阶段自检）。
+  issues: { type: Object, default: () => ({}) },
+})
 const urls = ref({})
 const failed = ref({})
 const open = ref(null)
@@ -30,10 +35,13 @@ async function download(a) {
 
 <template>
   <div class="shots">
-    <figure v-for="a in artifacts.filter(isImage)" :key="a.name" class="shot" @click="urls[a.name] && (open = a)">
+    <figure v-for="a in artifacts.filter(isImage)" :key="a.name" class="shot" @click="urls[a.name] && (open = a)"
+      :class="{ 'shot-bad': issues[a.name] }" :title="issues[a.name] || ''">
       <img v-if="urls[a.name]" :src="urls[a.name]" :alt="a.name" loading="lazy" />
       <div v-else class="shot-ph"><ImageOff v-if="failed[a.name]" :size="18" /><span v-else class="spin-dot" /></div>
+      <span v-if="issues[a.name]" class="shot-badge">不可用</span>
       <figcaption class="mono">{{ a.name }}</figcaption>
+      <span v-if="issues[a.name]" class="shot-why">{{ issues[a.name] }}</span>
     </figure>
   </div>
   <div v-if="artifacts.some((a) => !isImage(a))" class="row" style="margin-top: 10px; gap: 6px">

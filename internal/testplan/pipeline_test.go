@@ -52,7 +52,7 @@ func sim(t *testing.T, cfg Config, input Input, outputs func(StageSpec) (string,
 				name += "@" + st.Stage.Harness
 			}
 			roles = append(roles, name)
-			rec := StageRecord{Seq: i, Role: st.Stage.Role, Round: st.Stage.Round, Harness: st.Stage.Harness, Status: status, Output: out, DurationMS: ms, CostUSD: 0.5}
+			rec := StageRecord{Seq: i, Role: st.Stage.Role, Round: st.Stage.Round, Harness: st.Stage.Harness, Status: status, Output: out, DurationMS: ms, CostUSD: 0.5, Note: st.Note}
 			if st.Stage.Role == RoleService {
 				rec.Service = &protocol.ServiceStatus{Running: status == StatusOK, URL: "http://127.0.0.1:3000", StartCmd: st.Stage.Service.StartCmd}
 			}
@@ -74,8 +74,12 @@ func happy(challengeRounds int) func(StageSpec) (string, json.RawMessage, int64)
 			return StatusOK, report("pass", "unverifiable"), 120000
 		case RoleUI:
 			return StatusOK, j(map[string]any{"summary": "ui", "pages": []UIPage{{URL: "/", Screenshots: []string{"home.png"}}},
+				"shots":    []Shot{{File: "home.png", URL: "/", State: "首页", Purpose: "AC-2", Readable: true}},
 				"acs":      []map[string]string{{"id": "AC-2", "status": "pass", "evidence": "截图 home.png", "confidence": "high"}},
 				"findings": []map[string]string{{"severity": "low", "title": "按钮错位", "detail": "d", "evidence": "e"}}}), 60000
+		case RoleShots:
+			return StatusOK, j(map[string]any{"summary": "截图都可用",
+				"shot_reviews": []map[string]any{{"file": "home.png", "verdict": "usable", "occluded": false, "readable": true, "problems": []string{}, "suggest": ""}}}), 30000
 		case RoleRed:
 			var ch []map[string]string
 			if s.Round <= challengeRounds {
@@ -109,13 +113,40 @@ func TestTierPipelines(t *testing.T) {
 	}
 	for _, c := range cases {
 		roles, _, st := sim(t, withHarness(Preset(c.tier)), in, happy(c.rounds))
-		if got := strings.Join(roles, " "); got != c.want {
+		// A/S 档会多一个截图质检阶段：切掉它再比对，其余顺序保持一致。
+		if got := strings.Join(withoutRole(roles, RoleShots), " "); got != c.want {
 			t.Errorf("%s 档(质疑 %d 轮): %s\n  want %s", c.tier, c.rounds, got, c.want)
+		}
+		if c.tier == TierA || c.tier == TierS {
+			if !containsRole(roles, RoleShots) {
+				t.Errorf("%s 档应有截图质检阶段: %s", c.tier, strings.Join(roles, " "))
+			}
 		}
 		if st.Action != ActionFinish || st.Fatal != "" {
 			t.Errorf("%s 档应正常结束: %+v", c.tier, st)
 		}
 	}
+}
+
+// withoutRole 去掉指定的角色（含带轮次后缀的写法）。
+func withoutRole(roles []string, role string) []string {
+	var out []string
+	for _, r := range roles {
+		if r == role || strings.HasPrefix(r, role+"(") || strings.HasPrefix(r, role+"@") {
+			continue
+		}
+		out = append(out, r)
+	}
+	return out
+}
+
+func containsRole(roles []string, role string) bool {
+	for _, r := range roles {
+		if r == role || strings.HasPrefix(r, role+"(") || strings.HasPrefix(r, role+"@") {
+			return true
+		}
+	}
+	return false
 }
 
 func TestConsolidateFull(t *testing.T) {
@@ -168,11 +199,13 @@ func TestCrossModelFallback(t *testing.T) {
 		}
 		return out(s)
 	})
-	if got := strings.Join(roles, " "); got != "plan service verify ui red1@codex red1 judge" {
+	if got := strings.Join(roles, " "); got != "plan service verify ui shots red1@codex red1 judge" {
 		t.Fatalf("交叉模型失败应改用主 harness 重试: %s", got)
 	}
-	if !strings.Contains(recs[5].Note, "交叉模型") && !strings.Contains(Next(cfg, in, recs[:5]).Note, "交叉模型") {
-		t.Fatal("重试应说明原因")
+	// 重试那条记录紧跟在失败的交叉模型尝试之后。
+	retry := len(recs) - 2
+	if !strings.Contains(recs[retry].Note, "交叉模型") {
+		t.Fatalf("重试应说明原因: %q", recs[retry].Note)
 	}
 }
 
@@ -283,7 +316,7 @@ func TestCrossModelStickyFallback(t *testing.T) {
 		return out(s)
 	})
 	got := strings.Join(roles, " ")
-	if got != "plan service verify ui red1@codex red1 recheck1 red2 recheck2 red3 explore judge" {
+	if got != "plan service verify ui shots red1@codex red1 recheck1 red2 recheck2 red3 explore judge" {
 		t.Fatalf("交叉模型失败后，后续轮次应直接用主 harness: %s", got)
 	}
 	_ = recs
@@ -291,6 +324,7 @@ func TestCrossModelStickyFallback(t *testing.T) {
 
 func TestFindingsDedupe(t *testing.T) {
 	cfg := withHarness(Preset(TierS))
+	cfg.ShotReview = false // 本测试只关心发现去重，不关心截图质检
 	ui := j(map[string]any{"acs": []any{}, "findings": []map[string]string{{"severity": "high", "title": "XSS", "detail": "d", "evidence": "e"}}})
 	recs := []StageRecord{
 		{Role: RolePlan, Status: StatusOK, Output: planOut},

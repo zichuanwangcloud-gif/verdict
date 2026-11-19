@@ -129,7 +129,16 @@ type StageResult struct {
 	CostUSD    float64         `json:"cost_usd,omitempty"`
 	DurationMS int64           `json:"duration_ms"`
 	Artifacts  []string        `json:"artifacts,omitempty"` // 已上传的产物文件名
-	Service    *ServiceStatus  `json:"service,omitempty"`   // service 阶段的结果
+	// ArtifactIssues 是 agent 对产物的基础检查结果（疑似空白、纯色、尺寸异常、重复）。
+	// 只作提示，不直接否决结论。
+	ArtifactIssues []ArtifactIssue `json:"artifact_issues,omitempty"`
+	Service        *ServiceStatus  `json:"service,omitempty"` // service 阶段的结果
+}
+
+// ArtifactIssue 是一个产物文件的基础检查问题。
+type ArtifactIssue struct {
+	File   string `json:"file"`
+	Reason string `json:"reason"`
 }
 
 // ServiceStatus 描述 agent 托管的被测服务。

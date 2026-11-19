@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
 	"strings"
@@ -97,6 +98,46 @@ func flow(stages []store.Stage) string {
 	return strings.Join(parts, " → ")
 }
 
+// unusableShots 返回最终被判为不可用的截图文件名。
+// 判定口径与 testplan 的硬约束一致：独立质检优先，其次是机器体检。
+func unusableShots(stages []store.Stage) []string {
+	var files []string
+	settled := map[string]bool{}
+	for _, st := range stages {
+		if st.Role != testplan.RoleShots || st.Status != testplan.StatusOK || len(st.Output) == 0 {
+			continue
+		}
+		var out struct {
+			Reviews []struct {
+				File    string `json:"file"`
+				Verdict string `json:"verdict"`
+			} `json:"shot_reviews"`
+		}
+		if json.Unmarshal(st.Output, &out) != nil {
+			continue
+		}
+		for _, rv := range out.Reviews {
+			if rv.File == "" || settled[rv.File] {
+				continue
+			}
+			settled[rv.File] = true
+			if rv.Verdict == "unusable" {
+				files = append(files, rv.File)
+			}
+		}
+	}
+	for _, st := range stages {
+		for _, i := range st.ArtifactIssues {
+			if i.File == "" || settled[i.File] {
+				continue
+			}
+			settled[i.File] = true
+			files = append(files, i.File)
+		}
+	}
+	return files
+}
+
 // CommentBody 生成回写到 Linear 的评论（Markdown）。
 func CommentBody(run store.Run, stages []store.Stage, base string) string {
 	var b strings.Builder
@@ -170,6 +211,9 @@ func CommentBody(run store.Run, stages []store.Stage, base string) string {
 			}
 			fmt.Fprintf(&b, "- %s %s：%s\n", severityText[f.Severity], mdCell(f.Title), mdCell(f.Detail))
 		}
+	}
+	if bad := unusableShots(stages); len(bad) > 0 {
+		fmt.Fprintf(&b, "\n> 📷 有 %d 张截图不可用（白屏、遮挡或画面不清），相关结论已降为无法验证（如果它只靠这些截图支撑）。详见报告页的截图区。\n", len(bad))
 	}
 	if base != "" {
 		fmt.Fprintf(&b, "\n[查看完整报告](%s/runs/%s)\n", base, run.ID)

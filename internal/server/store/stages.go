@@ -14,8 +14,8 @@ import (
 // Stage 是一个阶段的完整记录。
 type Stage struct {
 	testplan.StageRecord
-	RunID      string             `json:"run_id"`
-	Spec       testplan.StageSpec `json:"spec"`
+	RunID string             `json:"run_id"`
+	Spec  testplan.StageSpec `json:"spec"`
 	// FailureKind 是平台对失败原因的分类（transient / auth / other）。
 	FailureKind string     `json:"failure_kind"`
 	Attempt     int        `json:"attempt"`
@@ -26,13 +26,13 @@ type Stage struct {
 }
 
 const stageCols = `id, run_id, seq, role, round, kind, harness, status, note, error, spec, output, cost_usd, duration_ms, service, artifacts,
- failure_kind, attempt, next_attempt_at, created_at, started_at, finished_at`
+ artifact_issues, failure_kind, attempt, next_attempt_at, created_at, started_at, finished_at`
 
 func scanStage(sc interface{ Scan(...any) error }) (Stage, error) {
 	var st Stage
-	var spec, output, service, artifacts, next, created, started, finished string
+	var spec, output, service, artifacts, issues, next, created, started, finished string
 	err := sc.Scan(&st.ID, &st.RunID, &st.Seq, &st.Role, &st.Round, &st.Kind, &st.Harness, &st.Status, &st.Note, &st.Error,
-		&spec, &output, &st.CostUSD, &st.DurationMS, &service, &artifacts, &st.FailureKind, &st.Attempt, &next, &created, &started, &finished)
+		&spec, &output, &st.CostUSD, &st.DurationMS, &service, &artifacts, &issues, &st.FailureKind, &st.Attempt, &next, &created, &started, &finished)
 	st.NextAttempt = parseTime(next)
 	if err != nil {
 		return st, err
@@ -46,6 +46,7 @@ func scanStage(sc interface{ Scan(...any) error }) (Stage, error) {
 	if st.Artifacts == nil {
 		st.Artifacts = []string{}
 	}
+	_ = json.Unmarshal([]byte(issues), &st.ArtifactIssues)
 	if st.Attempt <= 0 {
 		st.Attempt = 1
 	}
@@ -135,10 +136,11 @@ func (s *Store) FinishStage(ctx context.Context, id string, r protocol.StageResu
 	if r.Status == testplan.StatusError || r.Status == testplan.StatusTimeout {
 		kind = testplan.ClassifyFailure(r.Status, r.Error)
 	}
-	res, err := s.db.ExecContext(ctx, `UPDATE stages SET status=?, error=?, output=?, cost_usd=?, duration_ms=?, service=?, artifacts=?, failure_kind=?, finished_at=?,
+	res, err := s.db.ExecContext(ctx, `UPDATE stages SET status=?, error=?, output=?, cost_usd=?, duration_ms=?, service=?, artifacts=?, artifact_issues=?, failure_kind=?, finished_at=?,
  started_at=CASE WHEN started_at='' THEN ? ELSE started_at END
  WHERE id=? AND status IN (?,?,?)`,
-		r.Status, r.Error, string(r.Structured), r.CostUSD, r.DurationMS, toJSON(r.Service), toJSON(nonNil(r.Artifacts)), kind, now(), now(),
+		r.Status, r.Error, string(r.Structured), r.CostUSD, r.DurationMS, toJSON(r.Service), toJSON(nonNil(r.Artifacts)),
+		toJSON(nonNilIssues(r.ArtifactIssues)), kind, now(), now(),
 		id, testplan.StatusPending, testplan.StatusSent, testplan.StatusRunning)
 	if err != nil {
 		return false, err
@@ -190,6 +192,13 @@ func (s *Store) CancelOpenStages(ctx context.Context, runID string) error {
 func nonNil(s []string) []string {
 	if s == nil {
 		return []string{}
+	}
+	return s
+}
+
+func nonNilIssues(s []protocol.ArtifactIssue) []protocol.ArtifactIssue {
+	if s == nil {
+		return []protocol.ArtifactIssue{}
 	}
 	return s
 }

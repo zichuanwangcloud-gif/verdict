@@ -22,6 +22,8 @@ func roleIntro(role string, round int, cfg Config) string {
 		return "你是蓝队测试工程师，负责按测试计划逐条实测这个分支是否满足验收标准。"
 	case RoleUI:
 		return "你是 UI 走查工程师，使用无头浏览器在真实页面上验证界面类的验收标准。"
+	case RoleShots:
+		return "你是截图质检员，只判断 UI 走查产出的截图能不能当作验收证据。"
 	case RoleRed:
 		return fmt.Sprintf("你是红队审查员（第 %d 轮）。蓝队已经给出了结论和证据，你的任务是**找出其中的错误**。你和蓝队是相互独立的会话，不要默认相信蓝队。", round)
 	case RoleRecheck:
@@ -58,6 +60,8 @@ func buildPrompt(role string, round int, cfg Config, in Input, recs []StageRecor
 		writeVerifyTask(&b, cfg, in, plan, recs)
 	case RoleUI:
 		writeUITask(&b, cfg, in, recs, plan, cur)
+	case RoleShots:
+		writeShotsTask(&b, recs, cur)
 	case RoleRed:
 		writeRedTask(&b, plan, cur)
 	case RoleRecheck:
@@ -66,6 +70,14 @@ func buildPrompt(role string, round int, cfg Config, in Input, recs []StageRecor
 		writeExploreTask(&b, cur)
 	case RoleJudge:
 		writeJudgeTask(&b, plan, cur, recs)
+	}
+	if notes := suspiciousShots(recs); len(notes) > 0 && role != RoleShots {
+		b.WriteString("\n## 截图提示\n")
+		b.WriteString("平台对本次产出的截图做了基础检查，以下文件疑似空白、纯色或尺寸异常。它们不代表界面没问题，只是这些图本身不可靠：\n")
+		for _, n := range notes {
+			fmt.Fprintf(&b, "- `%s`：%s\n", n.File, n.Reason)
+		}
+		b.WriteString("不要把这几张图当作「通过」的证据；需要时重新截图或直接看页面。\n")
 	}
 	b.WriteString("\n完成后，按要求的结构输出结果。\n")
 	return b.String()
@@ -272,12 +284,33 @@ func writeUITask(b *strings.Builder, cfg Config, in Input, recs []StageRecord, p
 		b.WriteString("范围：只验证计划中 method 为 ui 的条目，以及完成这些条目需要经过的页面。\n")
 	}
 	b.WriteString(`
+截图纪律（每一张图都要守）：
+1. 截之前先让画面稳定：等动画、过渡结束，请求完成、loading 消失后再截；必要时等 300 到 500 毫秒。不要截 loading、骨架屏、进度条、一闪而过的 toast——除非这些本身就是验收对象。
+2. 遮挡要分清两种情况：
+   - 待验证的对象本身就是弹窗 / 抽屉 / 对话框：先截一张「打开」的状态（文件名如 ac-3-dialog-open.png），再关掉它截一张「关闭后」作为对照（ac-3-dialog-closed.png）。
+   - 只是意外遮挡（引导层、公告条、cookie 提示、遮罩）：先想办法关掉或移开，再截；关不掉的在 issues 里写明被什么挡住了。
+3. 视口固定：桌面 1280×800，移动 390×844。超长页面分段截，不要把整页压成一张看不清的图。
+4. 文件名带语义，一看就知道这张图证明什么：ac-3-form-error.png、ac-5-empty-state.png。只用英文、数字和短横线，以 .png 结尾。
+5. 总张数不超过 12 张；超出时优先保留每条验收标准的主证据图。
+
 要求：
-1. 关键状态都要截图，保存到环境变量 VERDICT_ARTIFACTS 指向的目录，文件名只用英文、数字和短横线，以 .png 结尾；在 pages[].screenshots 里填写文件名。
-2. acs 只输出你用浏览器实际验证过的条目，编号与计划一致；evidence 写清操作步骤和看到的结果，并引用截图文件名；response 填空字符串。
-3. 与验收标准无关、但确实存在的界面问题写进 findings，附复现步骤或截图文件名；不要写主观的审美意见。
-4. 浏览器工具不可用时，可以改用 playwright 脚本；都不可用时，ui 条目判 unverifiable 并说明原因。
+1. 截图保存到环境变量 VERDICT_ARTIFACTS 指向的目录；文件名同时填进 pages[].screenshots。
+2. 每张图都要在顶层 shots 数组里登记：file（文件名）、url、state（这张图是什么界面状态）、purpose（用来证明哪条验收标准）、covered（画面是否被遮挡）、readable（内容是否清晰可辨）、issues（自检发现的问题，没有就填空数组）。没有登记的截图不算证据。
+3. acs 只输出你用浏览器实际验证过的条目，编号与计划一致；evidence 写清操作步骤和看到的结果，并引用截图文件名；response 填空字符串。
+4. 与验收标准无关、但确实存在的界面问题写进 findings，附复现步骤或截图文件名；不要写主观的审美意见。
+5. 浏览器工具不可用时，可以改用 playwright 脚本；都不可用时，ui 条目判 unverifiable 并说明原因。
 `)
+	if cfg.ShotSelfCheck {
+		b.WriteString(`
+截图后自检（必做）：截完一张就用读图能力回看这张图，确认真实内容——
+- 关键区域是否真的可见？文字是否可辨？
+- 有没有被意料之外的遮挡盖住？有没有停在半渲染 / 白屏 / 骨架屏的状态？
+- 这张图能不能真的支撑你要写进 evidence 的结论？
+不达标就先把画面收拾好再截一次，不要带着坏图往下走。确实截不好的（例如必须登录、必须特定数据），把原因写进 issues，对应条目判 unverifiable——不要用一张坏图凑一个通过。
+`)
+	} else {
+		b.WriteString("\n本档位不要求回看截图；因此不要在 evidence 里声称「已回看图片」，只写操作步骤和页面上可见的文本。\n")
+	}
 	if plan != nil {
 		var items []PlanItem
 		for _, it := range plan.Items {
@@ -292,6 +325,39 @@ func writeUITask(b *strings.Builder, cfg Config, in Input, recs []StageRecord, p
 	}
 	if len(cur.ACs) > 0 {
 		b.WriteString("\n蓝队目前的结论（供参考）：\n\n")
+		b.WriteString(renderACs(cur.ACs, false))
+	}
+}
+
+func writeShotsTask(b *strings.Builder, recs []StageRecord, cur Result) {
+	b.WriteString(`你是截图质检员。UI 走查阶段已经截了图，并在 evidence 里引用了这些文件名，但截图的人同时也是判断截图好坏的人。你的任务是**只看图本身**，判断每一张能不能当作验收证据。
+
+你可以读文件：截图保存在环境变量 VERDICT_ARTIFACTS 指向的目录里，文件名见下面的清单。逐张打开看，不要只看文件名就下结论。
+
+判定标准：
+- usable：画面完整、关键区域可见、文字可辨，确实能支撑它声明的用途。
+- unusable：白屏、停在 loading / 骨架屏、被遮挡层盖住、缩放到看不清、截图错页面、与声明的状态不符。
+
+对每张图输出一条 shot_reviews：file、verdict、occluded（是否被遮挡）、readable（是否清晰可辨）、problems（具体问题）、suggest（怎么重截才能用）。
+不要重新做验收测试，不要修改结论，也不要提审美意见。summary 用中文总结这批截图整体的可用性。
+`)
+	if cur.Shots != nil {
+		b.WriteString("\n待质检的截图：\n\n")
+		for _, s := range cur.Shots {
+			fmt.Fprintf(b, "- `%s`：%s", s.File, s.State)
+			if s.URL != "" {
+				fmt.Fprintf(b, "（%s）", s.URL)
+			}
+			if s.Purpose != "" {
+				fmt.Fprintf(b, "，用途：%s", s.Purpose)
+			}
+			b.WriteString("\n")
+		}
+	} else {
+		b.WriteString("\n待质检的截图清单为空：本次 UI 走查没有登记任何截图。\n")
+	}
+	if len(cur.ACs) > 0 {
+		b.WriteString("\n这些截图被引用在以下的结论里：\n\n")
 		b.WriteString(renderACs(cur.ACs, false))
 	}
 }
@@ -383,7 +449,7 @@ acs 必须覆盖下面列出的每一条，编号保持不变。
 }
 
 var roleName = map[string]string{
-	RolePlan: "测试计划", RoleService: "启动服务", RoleVerify: "执行验证", RoleUI: "UI 走查",
+	RolePlan: "测试计划", RoleService: "启动服务", RoleVerify: "执行验证", RoleUI: "UI 走查", RoleShots: "截图质检",
 	RoleRed: "红队质疑", RoleRecheck: "蓝队复测", RoleExplore: "主动探索", RoleJudge: "裁决",
 }
 

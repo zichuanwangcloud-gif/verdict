@@ -251,7 +251,7 @@ func (a *Agent) runStage(ctx context.Context, s *session, m protocol.Stage) prot
 		before := snapshot(s.artifacts)
 		out, err := h.Run(ctx, spec)
 		upCtx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
-		res.Artifacts = a.uploadNew(upCtx, s, m.StageID, before, logf)
+		res.Artifacts, res.ArtifactIssues = a.uploadNew(upCtx, s, m.StageID, before, logf)
 		cancel()
 		_ = os.RemoveAll(spec.TempDir)
 		res.CostUSD = out.CostUSD

@@ -33,7 +33,7 @@ const admin = "test-admin"
 var png = []byte{0x89, 'P', 'N', 'G', 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 0x0d, 'I', 'H', 'D', 'R', 0, 0, 0, 1, 0, 0, 0, 1, 8, 6, 0, 0, 0, 0x1f, 0x15, 0xc4, 0x89, 0, 0, 0, 0x0a, 'I', 'D', 'A', 'T', 0x78, 0x9c, 0x63, 0, 1, 0, 0, 5, 0, 1, 0x0d, 0x0a, 0x2d, 0xb4, 0, 0, 0, 0, 'I', 'E', 'N', 'D', 0xae, 'B', 0x60, 0x82}
 
 func role(prompt string) string {
-	for k, v := range map[string]string{"测试设计负责人": "plan", "负责按测试计划逐条实测": "verify", "UI 走查工程师": "ui",
+	for k, v := range map[string]string{"测试设计负责人": "plan", "负责按测试计划逐条实测": "verify", "UI 走查工程师": "ui", "截图质检员": "shots",
 		"红队审查员": "red", "针对质疑重新实测": "recheck", "探索性测试工程师": "explore", "裁决者": "judge"} {
 		if strings.Contains(prompt, k) {
 			return v
@@ -189,8 +189,12 @@ func (f *fake) Run(ctx context.Context, spec harness.RunSpec) (harness.Output, e
 		os.MkdirAll(filepath.Join(dir, "shots"), 0o755)
 		os.WriteFile(filepath.Join(dir, "shots", "home page.png"), png, 0o644)
 		return out(map[string]any{"summary": "ui", "pages": []map[string]any{{"url": "/", "title": "首页", "screenshots": []string{"shots-home_page.png"}, "observations": ""}},
+			"shots":    []map[string]any{{"file": "shots-home_page.png", "url": "/", "state": "首页", "purpose": "AC-2", "covered": false, "readable": true, "issues": []string{}}},
 			"acs":      []map[string]string{{"id": "AC-2", "criterion": "", "status": "pass", "evidence": "截图 shots-home_page.png", "reasoning": "", "confidence": "high", "response": ""}},
 			"findings": []map[string]string{{"severity": "low", "title": "按钮错位", "detail": "d", "evidence": "e"}}})
+	case "shots":
+		return out(map[string]any{"summary": "截图都可用", "shot_reviews": []map[string]any{
+			{"file": "shots-home_page.png", "verdict": "usable", "occluded": false, "readable": true, "problems": []string{}, "suggest": ""}}})
 	case "red":
 		var ch []map[string]string
 		if strings.Contains(spec.Prompt, "CHALLENGE") && !strings.Contains(spec.Prompt, "第 1 轮质疑") {
@@ -451,7 +455,7 @@ func TestTierSFullPipeline(t *testing.T) {
 	if r.Status != "completed" {
 		t.Fatalf("应完成: %s %s", r.Status, r.Error)
 	}
-	if got := flow(r); got != "plan service verify ui red1@codex recheck1 red2@codex explore judge" {
+	if got := flow(r); got != "plan service verify ui shots red1@codex recheck1 red2@codex explore judge" {
 		t.Fatalf("S 档流程不对: %s", got)
 	}
 	if r.Config.RedHarness != "codex" || strings.Join(e.codex.calls(), ",") != "red,red" {
@@ -514,12 +518,26 @@ func TestTierSFullPipeline(t *testing.T) {
 func TestCrossModelFallbackAndService(t *testing.T) {
 	e := setup(t)
 	r := e.waitDone(e.newRun("A", "需求 CODEX_DOWN", nil).ID)
-	if got := flow(r); got != "plan service verify ui red1@codex(error) red1 judge" {
+	if got := flow(r); got != "plan service verify ui shots red1@codex(error) red1 judge" {
 		t.Fatalf("交叉模型失败应降级重试: %s", got)
 	}
-	if !strings.Contains(r.Stages[5].Note, "交叉模型 codex 执行失败") || r.Status != "completed" {
-		t.Fatalf("重试说明不对: %q %s", r.Stages[5].Note, r.Status)
+	retry := -1
+	for i, st := range r.Stages {
+		if st.Role == "red" && st.Harness == "codex" {
+			retry = i + 1
+		}
 	}
+	if retry < 0 || retry >= len(r.Stages) || !strings.Contains(r.Stages[retry].Note, "交叉模型 codex 执行失败") || r.Status != "completed" {
+		t.Fatalf("重试说明不对: 第 %d 个阶段 %q，状态 %s", retry, stageNote(r.Stages, retry), r.Status)
+	}
+}
+
+// stageNote 安全地取某个阶段的说明，越界时返回空。
+func stageNote(stages []store.Stage, i int) string {
+	if i < 0 || i >= len(stages) {
+		return ""
+	}
+	return stages[i].Note
 }
 
 func TestApprovalGate(t *testing.T) {

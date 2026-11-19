@@ -47,6 +47,31 @@ const plan = computed(() => {
 const shownLogs = computed(() => (stageFilter.value ? logs.value.filter((l) => l.stage === stageFilter.value) : logs.value))
 
 const currentStage = computed(() => stages.value.find((s) => s.id === run.value?.current_stage))
+
+// shotIssues 汇总各阶段对截图的判定，文件名 → 不可用原因，用来在画廊里打标。
+// 优先级：独立质检 > 机器体检 > UI 阶段自检（与后端 shotVerdict 保持一致）。
+const shotIssues = computed(() => {
+  const out = {}
+  const bad = (file, reason) => { if (file && reason && !out[file]) out[file] = reason }
+  const ui = stages.value.find((s) => s.role === 'ui' && s.status === 'ok')
+  const shots = stages.value.find((s) => s.role === 'shots' && s.status === 'ok')
+  if (shots?.output?.shot_reviews) {
+    for (const r of shots.output.shot_reviews) {
+      if (r.verdict === 'unusable') out[r.file] = [...(r.problems || [])].join('；') || '质检判定不可用'
+    }
+  }
+  for (const st of stages.value) {
+    for (const i of st.artifact_issues || []) {
+      if (!out[i.file]) out[i.file] = i.reason
+    }
+  }
+  for (const s of ui?.output?.shots || []) {
+    if (out[s.file]) continue
+    if (s.covered) bad(s.file, '画面被遮挡')
+    else if (s.readable === false) bad(s.file, '内容不清晰')
+  }
+  return out
+})
 const liveLabel = computed(() => {
   const r = run.value
   if (!r) return ''
@@ -297,7 +322,7 @@ const legacySteps = computed(() => {
                 <p v-if="p.observations" class="body text-2">{{ p.observations }}</p>
               </div>
             </div>
-            <ArtifactGallery :run-id="run.id" :artifacts="run.artifacts" />
+            <ArtifactGallery :run-id="run.id" :artifacts="run.artifacts" :issues="shotIssues" />
           </section>
 
           <!-- 计划（非等待状态） -->

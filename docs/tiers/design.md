@@ -25,6 +25,7 @@
 | 托管服务 `service` | — | ✅ | ✅ | ✅ |
 | 执行验证 `verify` | 只用命令行、单测、读代码 | ✅ 并自查 | ✅ | ✅ 关键检查跑两遍 |
 | UI 走查 `ui` | — | — | targeted：只走验收标准涉及的页面 | full：相关页面全量、控制台、多种宽度 |
+| 截图自检 / 质检 `shot_self_check` / `shot_review` | — | — | ✅ / ✅ | ✅ / ✅ |
 | 红队轮数 `red_rounds` | 0 | 0 | 1 | 3（提前收敛就停） |
 | 交叉模型 `cross_model` | — | — | ✅ | ✅ |
 | 主动探索 `explore` | — | — | — | ✅ |
@@ -34,7 +35,7 @@
 ## 阶段与流水线
 
 ```
-plan ─▶ [等待确认] ─▶ service ─▶ verify ─▶ ui ─▶ ( red ─▶ recheck )×N ─▶ explore ─▶ judge ─▶ 收尾
+plan ─▶ [等待确认] ─▶ service ─▶ verify ─▶ ui ─▶ shots ─▶ ( red ─▶ recheck )×N ─▶ explore ─▶ judge ─▶ 收尾
 ```
 
 - 每个 harness 阶段都是**一次新的会话**（新的 `claude -p` / `codex exec`），只通过平台传入的上下文（计划、证据、质疑）衔接。红队天然是「另一个人」。

@@ -47,6 +47,17 @@ var reportAC = obj(map[string]any{
 	"response":   str,
 })
 
+// shot 是一张截图的登记信息：它代表哪个界面状态、用来证明哪条验收标准、画面是否可用。
+var shot = obj(map[string]any{
+	"file":     str,
+	"url":      str,
+	"state":    str,
+	"purpose":  str,
+	"covered":  boolean, // 画面是否被遮挡
+	"readable": boolean, // 内容是否清晰可辨
+	"issues":   arr(str),
+})
+
 var (
 	PlanSchema = mustSchema(obj(map[string]any{
 		"summary":       str,
@@ -81,8 +92,22 @@ var (
 			"screenshots":  arr(str),
 			"observations": str,
 		})),
+		"shots":    arr(shot),
 		"acs":      arr(reportAC),
 		"findings": arr(finding),
+	}))
+
+	// ShotsSchema 是独立截图质检阶段的输出：只判断每张图能不能当证据用。
+	ShotsSchema = mustSchema(obj(map[string]any{
+		"summary": str,
+		"shot_reviews": arr(obj(map[string]any{
+			"file":     str,
+			"verdict":  enum("usable", "unusable"),
+			"occluded": boolean,
+			"readable": boolean,
+			"problems": arr(str),
+			"suggest":  str,
+		})),
 	}))
 
 	RedSchema = mustSchema(obj(map[string]any{
@@ -168,10 +193,48 @@ type UIPage struct {
 	Observations string   `json:"observations"`
 }
 
+// Shot 是一张截图的登记信息。Covered / Readable 由 UI 阶段自检后填写，
+// 独立质检阶段的结论另见 ShotReview。
+type Shot struct {
+	File     string   `json:"file"`
+	URL      string   `json:"url"`
+	State    string   `json:"state"`    // 这张图对应的界面状态，如「弹窗打开」「表单报错」
+	Purpose  string   `json:"purpose"`  // 用来证明哪条验收标准
+	Covered  bool     `json:"covered"`  // 画面是否被遮挡
+	Readable bool     `json:"readable"` // 内容是否清晰可辨
+	Issues   []string `json:"issues"`
+}
+
+// ShotReview 是独立质检阶段对一张截图的判定。
+type ShotReview struct {
+	File     string   `json:"file"`
+	Verdict  string   `json:"verdict"` // usable / unusable
+	Occluded bool     `json:"occluded"`
+	Readable bool     `json:"readable"`
+	Problems []string `json:"problems"`
+	Suggest  string   `json:"suggest"`
+	Source   string   `json:"source,omitempty"` // 判定来自哪个阶段（self / shots / machine）
+}
+
 type uiOut struct {
 	reportOut
 	Pages    []UIPage     `json:"pages"`
+	Shots    []Shot       `json:"shots"`
 	Findings []findingOut `json:"findings"`
+}
+
+type shotReviewOut struct {
+	File     string   `json:"file"`
+	Verdict  string   `json:"verdict"`
+	Occluded bool     `json:"occluded"`
+	Readable bool     `json:"readable"`
+	Problems []string `json:"problems"`
+	Suggest  string   `json:"suggest"`
+}
+
+type shotsOut struct {
+	Summary string          `json:"summary"`
+	Reviews []shotReviewOut `json:"shot_reviews"`
 }
 
 type challengeOut struct {

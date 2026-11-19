@@ -11,6 +11,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"verdict/internal/protocol"
 )
 
 const (
@@ -50,8 +52,8 @@ func artifactName(rel string) string {
 	return n
 }
 
-// uploadNew 上传本阶段新增或更新的产物，返回成功上传的文件名。
-func (a *Agent) uploadNew(ctx context.Context, s *session, stageID string, before map[string]time.Time, logf func(string)) []string {
+// uploadNew 上传本阶段新增或更新的产物，返回成功上传的文件名，以及基础检查发现的问题。
+func (a *Agent) uploadNew(ctx context.Context, s *session, stageID string, before map[string]time.Time, logf func(string)) ([]string, []protocol.ArtifactIssue) {
 	after := snapshot(s.artifacts)
 	var paths []string
 	for p, mt := range after {
@@ -61,6 +63,8 @@ func (a *Agent) uploadNew(ctx context.Context, s *session, stageID string, befor
 	}
 	sort.Strings(paths)
 	var names []string
+	var issues []protocol.ArtifactIssue
+	seen := map[[16]byte]string{} // 本阶段已上传图片的指纹 → 文件名，用来发现重复截图
 	for _, p := range paths {
 		if s.uploaded >= maxArtifactsRun {
 			logf(fmt.Sprintf("⚠ 产物数量超过 %d 个，其余未上传", maxArtifactsRun))
@@ -76,6 +80,10 @@ func (a *Agent) uploadNew(ctx context.Context, s *session, stageID string, befor
 		}
 		rel, _ := filepath.Rel(s.artifacts, p)
 		name := artifactName(rel)
+		if problem := inspectShot(p, info.Size(), seen); problem != "" {
+			issues = append(issues, protocol.ArtifactIssue{File: name, Reason: problem})
+			logf(fmt.Sprintf("⚠ 截图 %s 质检提示：%s", name, problem))
+		}
 		if err := a.upload(ctx, s.runID, stageID, name, p); err != nil {
 			logf(fmt.Sprintf("⚠ 上传产物 %s 失败: %v", name, err))
 			continue
@@ -86,7 +94,7 @@ func (a *Agent) uploadNew(ctx context.Context, s *session, stageID string, befor
 	if len(names) > 0 {
 		logf(fmt.Sprintf("📎 已上传 %d 个产物：%s", len(names), strings.Join(names, "、")))
 	}
-	return names
+	return names, issues
 }
 
 func (a *Agent) upload(ctx context.Context, runID, stageID, name, path string) error {
