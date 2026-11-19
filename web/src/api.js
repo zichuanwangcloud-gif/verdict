@@ -108,6 +108,13 @@ export const api = {
   truth: (id) => call('GET', `/runs/${id}/truth`),
   setTruth: (id, body) => call('PUT', `/runs/${id}/truth`, body),
   clearTruth: (id) => call('DELETE', `/runs/${id}/truth`),
+  reviewStats: ({ repoId = 0, tier = '', days = 90 } = {}) => {
+    const p = new URLSearchParams()
+    if (repoId) p.set('repo_id', repoId)
+    if (tier) p.set('tier', tier)
+    p.set('days', days)
+    return call('GET', '/review/stats?' + p.toString())
+  },
 }
 
 // 产物需要带管理员令牌下载：取成 blob URL 供 <img> 使用。

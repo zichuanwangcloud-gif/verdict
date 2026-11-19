@@ -811,3 +811,46 @@ table.matrix tr.hot td { background: var(--bad-bg); }
 .review.unmarked { border-color: color-mix(in srgb, var(--violet) 30%, var(--border)); }
 .board-run { flex-wrap: wrap; gap: 6px; align-items: center; }
 .board-run .pill.bt { flex: none; }
+
+/* ---------- 复盘指标 ---------- */
+.review-grid { display: grid; grid-template-columns: minmax(0, 1.15fr) minmax(0, 1fr); gap: 16px; }
+@media (max-width: 1000px) { .review-grid { grid-template-columns: minmax(0, 1fr); } }
+
+/* 混淆矩阵：只有 6 格，每格都带数字和语义标签，颜色不单独承载信息。 */
+table.cm { width: 100%; border-collapse: separate; border-spacing: 4px; font-size: 13px; }
+table.cm th { font-weight: 550; color: var(--text-2); text-align: left; padding: 4px 6px; font-size: 12px; }
+table.cm thead th { color: var(--muted); font-weight: 600; }
+table.cm tbody th { white-space: nowrap; }
+table.cm tfoot th, table.cm tfoot td { border-top: 1px solid var(--border); padding-top: 8px; }
+.cm-cell {
+  display: flex; flex-direction: column; gap: 2px; align-items: flex-start;
+  min-height: 56px; padding: 8px 10px; border-radius: var(--radius-sm);
+  border: 1px solid var(--border);
+}
+/* 语义底色：好/坏/存疑。颜色与旁边的文字标签同时出现，不单独承载信息。 */
+.cm-cell.ok { background: var(--ok-bg); border-color: color-mix(in srgb, var(--ok) 26%, transparent); }
+.cm-cell.bad { background: var(--bad-bg); border-color: color-mix(in srgb, var(--bad) 26%, transparent); }
+.cm-cell.warn { background: var(--warn-bg); border-color: color-mix(in srgb, var(--warn) 26%, transparent); }
+.cm-cell.zero { border-style: dashed; background: none; }
+.cm-num { font-size: 20px; font-weight: 700; letter-spacing: -0.02em; color: var(--text); }
+.cm-cell.zero .cm-num { color: var(--muted); font-weight: 500; }
+.cm-tag { font-size: 11px; font-weight: 600; }
+.cm-tag.ok { color: var(--ok); }
+.cm-tag.bad { color: var(--bad); }
+.cm-tag.warn { color: var(--warn); }
+.cm-sum { text-align: right; font-variant-numeric: tabular-nums; }
+
+.rules { margin: 0; padding-left: 18px; display: flex; flex-direction: column; gap: 6px; font-size: 12.5px; color: var(--text-2); line-height: 1.55; }
+.rules b { color: var(--text); font-weight: 600; }
+
+/* 样本清单 */
+.review-list { display: flex; flex-direction: column; }
+.review-row {
+  display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: center; gap: 14px;
+  padding: 12px 20px; border-bottom: 1px solid var(--border); color: var(--text); cursor: pointer;
+  transition: background .12s;
+}
+.review-row:last-child { border-bottom: none; }
+.review-row:hover { background: var(--surface); text-decoration: none; }
+.review-row.invalid { opacity: 0.55; }
+.review-row .pill { white-space: nowrap; }
