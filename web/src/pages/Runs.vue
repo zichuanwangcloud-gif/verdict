@@ -3,7 +3,7 @@ import { ref, computed, onMounted, onUnmounted } from 'vue'
 import { Plus, Sparkles, Activity, CircleCheck, CircleX, ListChecks, GitCommitHorizontal } from 'lucide-vue-next'
 import { api } from '../api'
 import { go } from '../router'
-import { fmtTime, fmtDuration, harnessName, isLive, ago, tierMeta } from '../format'
+import { fmtTime, fmtDuration, harnessName, isLive, ago, tierMeta, truthText, truthTone } from '../format'
 import StatusPill from '../components/StatusPill.vue'
 import AcBar from '../components/AcBar.vue'
 import HarnessLogo from '../components/HarnessLogo.vue'
@@ -110,6 +110,10 @@ const stats = computed(() => {
           <div class="run-meta hide-sm">
             <span class="row" style="gap: 6px"><HarnessLogo :name="r.harness" style="width: 18px; height: 18px; font-size: 10px; border-radius: 5px" /> {{ harnessName(r.harness) }}</span>
             <span class="muted" :title="fmtTime(r.created_at)">{{ ago(r.created_at) }} · {{ fmtDuration(r.started_at, r.finished_at) }}</span>
+            <span v-if="r.status === 'completed'" class="chip truth" :class="r.truth ? truthTone[r.truth.verdict] : 'pending'">
+              <template v-if="r.truth">{{ truthText[r.truth.verdict] }}</template>
+              <template v-else>待人工复核</template>
+            </span>
           </div>
         </a>
       </div>

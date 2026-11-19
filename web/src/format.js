@@ -132,3 +132,7 @@ export const regressionStatusText = { running: '进行中', completed: '已结�
 export const regressionVerdictText = { pass: '通过', fail: '未通过', partial: '部分无法验证', incomplete: '未完成' }
 export const caseLevelText = { core: '核心', normal: '普通' }
 export const caseStatusText = { active: '启用', retired: '已停用' }
+
+export const truthText = { pass: '人工：通过', fail: '人工：未通过', invalid: '人工：无效' }
+export const truthTone = { pass: 'ok', fail: 'bad', invalid: '' }
+export const truthSourceText = { manual: '人工复测', ticket: '测试人员开单' }

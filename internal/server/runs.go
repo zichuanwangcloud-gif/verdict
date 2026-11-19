@@ -31,7 +31,29 @@ func (s *Server) listRuns(w http.ResponseWriter, r *http.Request) {
 		failErr(w, err)
 		return
 	}
-	ok(w, runs)
+	// 附带人工真值，列表上才能标出哪些测试还没复核。
+	ids := make([]string, 0, len(runs))
+	for _, run := range runs {
+		ids = append(ids, run.ID)
+	}
+	truths, err := s.st.TruthsFor(r.Context(), ids)
+	if err != nil {
+		failErr(w, err)
+		return
+	}
+	type runRow struct {
+		store.Run
+		Truth *store.Truth `json:"truth"`
+	}
+	out := make([]runRow, 0, len(runs))
+	for _, run := range runs {
+		row := runRow{Run: run}
+		if t, found := truths[run.ID]; found {
+			row.Truth = &t
+		}
+		out = append(out, row)
+	}
+	ok(w, out)
 }
 
 type manualIssue struct {
@@ -186,6 +208,7 @@ type runDetail struct {
 	store.Run
 	Stages    []store.Stage    `json:"stages"`
 	Artifacts []store.Artifact `json:"artifacts"`
+	Truth     *store.Truth     `json:"truth"`
 }
 
 func (s *Server) getRun(w http.ResponseWriter, r *http.Request) {
@@ -204,7 +227,11 @@ func (s *Server) getRun(w http.ResponseWriter, r *http.Request) {
 		failErr(w, err)
 		return
 	}
-	ok(w, runDetail{Run: run, Stages: stages, Artifacts: arts})
+	d := runDetail{Run: run, Stages: stages, Artifacts: arts}
+	if t, err := s.st.Truth(r.Context(), run.ID); err == nil {
+		d.Truth = &t
+	}
+	ok(w, d)
 }
 
 func (s *Server) runLogs(w http.ResponseWriter, r *http.Request) {

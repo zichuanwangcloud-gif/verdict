@@ -83,11 +83,26 @@ func (s *Server) issueBoard(w http.ResponseWriter, r *http.Request) {
 		linear.BoardIssue
 		LastRun *store.IssueRunBrief `json:"last_run"`
 	}
+	// 顺带查出每行最近一次测试的人工真值，行内才好标「已复核 / 待复核」。
+	runIDs := make([]string, 0, len(list))
+	for _, it := range list {
+		if b, found := last[it.Identifier]; found {
+			runIDs = append(runIDs, b.RunID)
+		}
+	}
+	truths, err := s.st.TruthsFor(r.Context(), runIDs)
+	if err != nil {
+		failErr(w, err)
+		return
+	}
 	rows := make([]row, 0, len(list))
 	for _, it := range list {
 		rw := row{BoardIssue: it}
 		if b, found := last[it.Identifier]; found {
 			rw.LastRun = &b
+			if t, ok := truths[b.RunID]; ok {
+				rw.LastRun.Truth = &t
+			}
 		}
 		rows = append(rows, rw)
 	}
