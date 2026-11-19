@@ -7,7 +7,7 @@ import {
 } from 'lucide-vue-next'
 import { api } from '../api'
 import { go } from '../router'
-import { ago, harnessName, tierMeta, isLive } from '../format'
+import { ago, harnessName, tierMeta, isLive, truthText, truthTone } from '../format'
 
 const repos = ref([])
 const runtimes = ref([])
@@ -452,6 +452,9 @@ const acOk = (acs) => (acs || []).filter((a) => a.status === 'pass').length
               <span v-if="lastRun(r).acs?.length" class="muted">{{ acOk(lastRun(r).acs) }}/{{ lastRun(r).acs.length }}</span>
             </button>
             <span v-else class="muted" style="font-size: 12px">未测试</span>
+            <span v-if="lastRun(r)?.truth" class="chip truth" :class="truthTone[lastRun(r).truth.verdict]">
+              {{ truthText[lastRun(r).truth.verdict] }}
+            </span>
           </div>
 
           <div class="board-act">

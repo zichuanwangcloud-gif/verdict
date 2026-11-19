@@ -17,6 +17,7 @@ import LogStream from '../components/LogStream.vue'
 import StageTimeline from '../components/StageTimeline.vue'
 import ArtifactGallery from '../components/ArtifactGallery.vue'
 import PlanPanel from '../components/PlanPanel.vue'
+import TruthPanel from '../components/TruthPanel.vue'
 
 const props = defineProps({ id: String })
 const run = ref(null)
@@ -247,6 +248,9 @@ const legacySteps = computed(() => {
         <div class="stack" style="gap: 20px; min-width: 0">
           <!-- 计划（等待确认时置顶） -->
           <PlanPanel v-if="plan && run.status === 'awaiting_approval'" :plan="plan" awaiting :busy="busy" @approve="approve" @cancel="cancel" />
+
+          <!-- 人工复核：test 结束后的真值标记 -->
+          <TruthPanel v-if="run.kind !== 'postmortem'" :run="run" @saved="(t) => (run.truth = t)" />
 
           <!-- 结论 -->
           <section v-if="run.acs?.length" class="card stack" style="gap: 16px">

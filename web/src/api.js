@@ -105,6 +105,9 @@ export const api = {
   rerun: (id) => call('POST', `/runs/${id}/rerun`),
   resumeRun: (id) => call('POST', `/runs/${id}/resume`),
   writeBack: (id) => call('POST', `/runs/${id}/linear`),
+  truth: (id) => call('GET', `/runs/${id}/truth`),
+  setTruth: (id, body) => call('PUT', `/runs/${id}/truth`, body),
+  clearTruth: (id) => call('DELETE', `/runs/${id}/truth`),
 }
 
 // 产物需要带管理员令牌下载：取成 blob URL 供 <img> 使用。

@@ -158,6 +158,16 @@ CREATE TABLE IF NOT EXISTS cases (
   updated_at TEXT NOT NULL,
   UNIQUE (repo_id, issue_key)
 );
+CREATE TABLE IF NOT EXISTS run_truths (
+  run_id TEXT PRIMARY KEY REFERENCES runs(id) ON DELETE CASCADE,
+  verdict TEXT NOT NULL,
+  source TEXT NOT NULL,
+  note TEXT NOT NULL DEFAULT '',
+  ticket TEXT NOT NULL DEFAULT '',
+  ticket_ref TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS case_history (
   case_id INTEGER NOT NULL REFERENCES cases(id) ON DELETE CASCADE,
   ts TEXT NOT NULL,
@@ -198,6 +208,7 @@ var migrations = []struct{ table, column, def string }{
 	{"stages", "next_attempt_at", "TEXT NOT NULL DEFAULT ''"},
 	{"stages", "artifact_issues", "TEXT NOT NULL DEFAULT '[]'"},
 	{"runs", "shots", "TEXT NOT NULL DEFAULT '[]'"},
+	{"runs", "kind", "TEXT NOT NULL DEFAULT 'test'"},
 }
 
 // 测试状态。
@@ -283,6 +294,8 @@ func migrate(db *sql.DB) error {
 		`CREATE INDEX IF NOT EXISTS runs_version ON runs(version_id)`,
 		`CREATE INDEX IF NOT EXISTS runs_regression ON runs(regression_id)`,
 		`CREATE INDEX IF NOT EXISTS runs_parent ON runs(parent_run_id)`,
+		`CREATE INDEX IF NOT EXISTS runs_kind ON runs(kind)`,
+		`CREATE INDEX IF NOT EXISTS run_truths_verdict ON run_truths(verdict)`,
 	} {
 		if _, err := db.Exec(q); err != nil {
 			return err

@@ -58,16 +58,18 @@ type Run struct {
 	Ports            []int               `json:"ports"`
 	ParentRunID      string              `json:"parent_run_id"`
 	Attempt          int                 `json:"attempt"`
-	CreatedAt        *time.Time          `json:"created_at"`
-	StartedAt        *time.Time          `json:"started_at"`
-	FinishedAt       *time.Time          `json:"finished_at"`
+	// Kind 是 run 的用途：test（验收测试）/ postmortem（差错复盘分析）。
+	Kind       string     `json:"kind"`
+	CreatedAt  *time.Time `json:"created_at"`
+	StartedAt  *time.Time `json:"started_at"`
+	FinishedAt *time.Time `json:"finished_at"`
 }
 
 const runCols = `r.id, r.repo_id, p.url, p.name, p.ports, r.branch, r.commit_sha, r.issue_key, r.issue, r.runtime_id, t.name,
  r.harness, r.tier, r.config, r.timeout_minutes, r.status, r.current_stage, r.verdict, r.summary, r.acs, r.findings, r.pages,
  r.approved, r.approval_note, r.awaiting_since, r.source_modified, r.diff, r.prompt, r.raw, r.cost_usd, r.error,
  r.linear_comment_url, r.linear_error, r.version_id, r.regression_id, r.case_id, r.pin_ref, r.pin_sha, r.plan_source,
- r.preset_plan, r.ports, r.parent_run_id, r.coverage, r.attempt, r.created_at, r.started_at, r.finished_at, r.shots
+ r.preset_plan, r.ports, r.parent_run_id, r.coverage, r.attempt, r.created_at, r.started_at, r.finished_at, r.shots, r.kind
  FROM runs r JOIN repos p ON p.id=r.repo_id JOIN runtimes t ON t.id=r.runtime_id`
 
 func scanRun(sc interface{ Scan(...any) error }) (Run, error) {
@@ -78,7 +80,7 @@ func scanRun(sc interface{ Scan(...any) error }) (Run, error) {
 		&r.RuntimeName, &r.Harness, &r.Tier, &cfg, &r.TimeoutMinutes, &r.Status, &r.CurrentStage, &r.Verdict, &r.Summary,
 		&acs, &findings, &pages, &approved, &r.ApprovalNote, &awaiting, &modified, &r.Diff, &r.Prompt, &r.Raw, &r.CostUSD,
 		&r.Error, &r.LinearCommentURL, &r.LinearError, &r.VersionID, &r.RegressionID, &r.CaseID, &r.PinRef, &r.PinSHA,
-		&r.PlanSource, &r.PresetPlan, &ports, &r.ParentRunID, &cov, &r.Attempt, &created, &started, &finished, &shots)
+		&r.PlanSource, &r.PresetPlan, &ports, &r.ParentRunID, &cov, &r.Attempt, &created, &started, &finished, &shots, &r.Kind)
 	if err != nil {
 		return r, err
 	}
@@ -120,6 +122,8 @@ type NewRun struct {
 	Issue     linear.Issue
 	RuntimeID int64
 	Config    testplan.Config
+	// Kind 是 run 的用途，空值按普通测试处理。
+	Kind string
 	// 以下用于版本与回归测试，普通测试留空。
 	VersionID    int64
 	RegressionID string
@@ -147,11 +151,15 @@ type execer interface {
 
 func (s *Store) insertRun(ctx context.Context, db execer, n NewRun) (string, error) {
 	id := RandomHex(6)
+	kind := n.Kind
+	if kind == "" {
+		kind = KindTest
+	}
 	_, err := db.ExecContext(ctx, `INSERT INTO runs(id, repo_id, branch, issue_key, issue, runtime_id, harness, tier, config, timeout_minutes, status, prompt,
- version_id, regression_id, case_id, pin_ref, pin_sha, plan_source, preset_plan, parent_run_id, attempt, created_at)
- VALUES(?,?,?,?,?,?,?,?,?,?,?,'',?,?,?,?,?,?,?,?,?,?)`, id, n.RepoID, n.Branch, n.Issue.Identifier, toJSON(n.Issue), n.RuntimeID, n.Config.Harness,
+ version_id, regression_id, case_id, pin_ref, pin_sha, plan_source, preset_plan, parent_run_id, attempt, created_at, kind)
+ VALUES(?,?,?,?,?,?,?,?,?,?,?,'',?,?,?,?,?,?,?,?,?,?,?)`, id, n.RepoID, n.Branch, n.Issue.Identifier, toJSON(n.Issue), n.RuntimeID, n.Config.Harness,
 		n.Config.Tier, toJSON(n.Config), n.Config.MaxMinutes, StatusQueued, n.VersionID, n.RegressionID, n.CaseID, n.PinRef, n.PinSHA,
-		n.PlanSource, n.PresetPlan, n.ParentRunID, max(n.Attempt, 1), now())
+		n.PlanSource, n.PresetPlan, n.ParentRunID, max(n.Attempt, 1), now(), kind)
 	return id, err
 }
 
@@ -165,7 +173,7 @@ func (s *Store) Run(ctx context.Context, id string) (Run, error) {
 
 // Runs 返回普通测试记录（不含回归子测试，它们在版本页里看）。
 func (s *Store) Runs(ctx context.Context, limit int) ([]Run, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT `+runCols+` WHERE r.regression_id='' ORDER BY r.created_at DESC, r.rowid DESC LIMIT ?`, limit)
+	rows, err := s.db.QueryContext(ctx, `SELECT `+runCols+` WHERE r.regression_id='' AND `+KindTestOnly+` ORDER BY r.created_at DESC, r.rowid DESC LIMIT ?`, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -370,6 +378,8 @@ type IssueRunBrief struct {
 	ACs        []protocol.ACResult `json:"acs"`
 	CreatedAt  *time.Time          `json:"created_at"`
 	FinishedAt *time.Time          `json:"finished_at"`
+	// Truth 是这次测试的人工结论（没标过时为空）。
+	Truth *Truth `json:"truth,omitempty"`
 }
 
 // LastRunsByIssue 返回这些 issue 在指定仓库上最近的一次测试（不含回归子测试）。
@@ -440,4 +450,92 @@ func (s *Store) ActiveRunsByIssue(ctx context.Context, repoID int64) (map[string
 		}
 	}
 	return out, rows.Err()
+}
+
+// run 的用途。分析型 run 复用测试基础设施，但不出现在测试列表与统计里。
+const (
+	KindTest       = "test"
+	KindPostmortem = "postmortem"
+)
+
+// KindTestOnly 是列表查询用的条件：只取验收测试，排除分析型 run。
+const KindTestOnly = "(r.kind='' OR r.kind='" + KindTest + "')"
+
+// ---- 人工真值 ----
+
+// Truth 是人工对某一次测试的判定。一条测试至多一条。
+type Truth struct {
+	RunID     string     `json:"run_id"`
+	Verdict   string     `json:"verdict"` // pass / fail / invalid
+	Source    string     `json:"source"`  // manual（人工复测）/ ticket（测试人员开单）
+	Note      string     `json:"note"`
+	Ticket    string     `json:"ticket"`     // 单子原文
+	TicketRef string     `json:"ticket_ref"` // 单号或链接
+	CreatedAt *time.Time `json:"created_at"`
+	UpdatedAt *time.Time `json:"updated_at"`
+}
+
+const (
+	TruthPass    = "pass"
+	TruthFail    = "fail"
+	TruthInvalid = "invalid"
+)
+
+// SetTruth 写入或覆盖一条真值。同一测试重复标记时就地更新。
+func (s *Store) SetTruth(ctx context.Context, t Truth) error {
+	ts := now()
+	_, err := s.db.ExecContext(ctx, `INSERT INTO run_truths(run_id, verdict, source, note, ticket, ticket_ref, created_at, updated_at)
+ VALUES(?,?,?,?,?,?,?,?)
+ ON CONFLICT(run_id) DO UPDATE SET verdict=excluded.verdict, source=excluded.source, note=excluded.note,
+   ticket=excluded.ticket, ticket_ref=excluded.ticket_ref, updated_at=excluded.updated_at`,
+		t.RunID, t.Verdict, t.Source, t.Note, t.Ticket, t.TicketRef, ts, ts)
+	return err
+}
+
+// Truth 读一条真值；没标过返回 ErrNotFound。
+func (s *Store) Truth(ctx context.Context, runID string) (Truth, error) {
+	return scanTruth(s.db.QueryRowContext(ctx,
+		`SELECT run_id, verdict, source, note, ticket, ticket_ref, created_at, updated_at FROM run_truths WHERE run_id=?`, runID))
+}
+
+// DeleteTruth 撤销标记。
+func (s *Store) DeleteTruth(ctx context.Context, runID string) error {
+	_, err := s.db.ExecContext(ctx, `DELETE FROM run_truths WHERE run_id=?`, runID)
+	return err
+}
+
+// TruthsFor 批量读真值，列表页给多行附角标用。
+func (s *Store) TruthsFor(ctx context.Context, runIDs []string) (map[string]Truth, error) {
+	out := map[string]Truth{}
+	if len(runIDs) == 0 {
+		return out, nil
+	}
+	ph, args := placeholders(runIDs)
+	rows, err := s.db.QueryContext(ctx, `SELECT run_id, verdict, source, note, ticket, ticket_ref, created_at, updated_at
+ FROM run_truths WHERE run_id IN (`+ph+`)`, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		t, err := scanTruth(rows)
+		if err != nil {
+			return nil, err
+		}
+		out[t.RunID] = t
+	}
+	return out, rows.Err()
+}
+
+func scanTruth(sc interface{ Scan(...any) error }) (Truth, error) {
+	var t Truth
+	var created, updated string
+	if err := sc.Scan(&t.RunID, &t.Verdict, &t.Source, &t.Note, &t.Ticket, &t.TicketRef, &created, &updated); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return t, ErrNotFound
+		}
+		return t, err
+	}
+	t.CreatedAt, t.UpdatedAt = parseTime(created), parseTime(updated)
+	return t, nil
 }
