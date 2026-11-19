@@ -154,6 +154,7 @@ func (s *Server) Handler() http.Handler {
 	api.HandleFunc("GET /api/runs/{id}/truth", s.getTruth)
 	api.HandleFunc("PUT /api/runs/{id}/truth", s.putTruth)
 	api.HandleFunc("DELETE /api/runs/{id}/truth", s.deleteTruth)
+	api.HandleFunc("GET /api/review/stats", s.reviewStats)
 
 	mux.Handle("/api/", s.requireAdmin(api))
 	if s.cfg.WebDir != "" {
