@@ -135,7 +135,7 @@ func TestUITaskHasShotDiscipline(t *testing.T) {
 	if st.Stage.Role != RoleUI {
 		t.Fatalf("应进入 UI 阶段: %s", st.Stage.Role)
 	}
-	for _, want := range []string{"截图纪律", "遮挡", "dialog-open", "shots", "回看"} {
+	for _, want := range []string{"截图纪律", "遮挡", "dialog-open", "shots", "回看", "净场检查", "browser_evaluate", "covered 指"} {
 		if !strings.Contains(st.Stage.Prompt, want) {
 			t.Errorf("UI 提示词缺少 %q", want)
 		}
@@ -172,5 +172,51 @@ func TestPromptWarnsAboutSuspiciousShots(t *testing.T) {
 	p := Next(cfg, in, recs).Stage.Prompt
 	if !strings.Contains(p, "截图提示") || !strings.Contains(p, "blank.png") {
 		t.Fatalf("后续阶段应收到疑似空白提示: %s", p)
+	}
+}
+
+func TestShotsStageGetsShotReviewsSchema(t *testing.T) {
+	cfg := withHarness(Preset(TierA))
+	recs := []StageRecord{
+		{Role: RolePlan, Status: StatusOK, Output: planOut},
+		{Role: RoleService, Status: StatusOK, Service: &protocol.ServiceStatus{Running: true, URL: "http://127.0.0.1:3000"}},
+		{Role: RoleVerify, Status: StatusOK, Output: report("pass", "pass")},
+		{Role: RoleUI, Status: StatusOK, Output: uiWith("见 a.png", Shot{File: "a.png", State: "首页", Readable: true})[0].Output},
+	}
+	st := Next(cfg, in, recs)
+	if st.Stage.Role != RoleShots {
+		t.Fatalf("应进入截图质检阶段: %+v", st)
+	}
+	if !strings.Contains(string(st.Stage.Schema), "shot_reviews") {
+		t.Fatalf("质检阶段必须下发 shot_reviews schema，否则结论无法被平台采纳: %s", st.Stage.Schema)
+	}
+}
+
+func TestShotSelfCheckCoveredNeedsIssue(t *testing.T) {
+	// covered 只在写明遮挡物（或同时不可读）时才算数：模型偶尔会把「这条已被覆盖」误填成 covered。
+	recs := uiWith("见 a.png", Shot{File: "a.png", State: "首页", Covered: true, Readable: true})
+	if bad := shotVerdict(recs); len(bad) != 0 {
+		t.Fatalf("covered 但没有说明具体遮挡时不应判不可用: %v", bad)
+	}
+	recs = uiWith("见 b.png", Shot{File: "b.png", State: "首页", Covered: true, Readable: true,
+		Issues: []string{"右上角 toast 挡住了标题"}})
+	if bad := shotVerdict(recs); !strings.Contains(bad["b.png"], "遮挡") {
+		t.Fatalf("写明遮挡物时应判不可用: %v", bad)
+	}
+}
+
+func TestShotsPromptExplainsOcclusion(t *testing.T) {
+	cfg := withHarness(Preset(TierA))
+	recs := []StageRecord{
+		{Role: RolePlan, Status: StatusOK, Output: planOut},
+		{Role: RoleService, Status: StatusOK, Service: &protocol.ServiceStatus{Running: true, URL: "http://127.0.0.1:3000"}},
+		{Role: RoleVerify, Status: StatusOK, Output: report("pass", "pass")},
+		{Role: RoleUI, Status: StatusOK, Output: uiWith("见 a.png", Shot{File: "a.png", State: "首页", Readable: true})[0].Output},
+	}
+	p := Next(cfg, in, recs).Stage.Prompt
+	for _, want := range []string{"遮挡判定", "每一张", "被验证对象"} {
+		if !strings.Contains(p, want) {
+			t.Errorf("截图质检提示词缺少 %q", want)
+		}
 	}
 }

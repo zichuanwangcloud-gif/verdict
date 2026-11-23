@@ -49,30 +49,51 @@ const shownLogs = computed(() => (stageFilter.value ? logs.value.filter((l) => l
 
 const currentStage = computed(() => stages.value.find((s) => s.id === run.value?.current_stage))
 
-// shotIssues 汇总各阶段对截图的判定，文件名 → 不可用原因，用来在画廊里打标。
+// shotState 汇总各阶段对截图的判定，文件名 → 原因。
 // 优先级：独立质检 > 机器体检 > UI 阶段自检（与后端 shotVerdict 保持一致）。
-const shotIssues = computed(() => {
-  const out = {}
-  const bad = (file, reason) => { if (file && reason && !out[file]) out[file] = reason }
-  const ui = stages.value.find((s) => s.role === 'ui' && s.status === 'ok')
+// hidden 是最终判定被遮挡的截图：前端不再展示，只留一行文字说明（自动清理）。
+const shotState = computed(() => {
+  const issues = {}
+  const hidden = {}
+  const settled = new Set() // 已有更高优先级的判定，低优先级不再改写
   const shots = stages.value.find((s) => s.role === 'shots' && s.status === 'ok')
-  if (shots?.output?.shot_reviews) {
-    for (const r of shots.output.shot_reviews) {
-      if (r.verdict === 'unusable') out[r.file] = [...(r.problems || [])].join('；') || '质检判定不可用'
+  for (const r of shots?.output?.shot_reviews || []) {
+    settled.add(r.file)
+    if (r.verdict === 'unusable' || r.occluded) {
+      const why = [...(r.problems || [])].join('；') || (r.occluded ? '画面被遮挡' : '质检判定不可用')
+      issues[r.file] = why
+      if (r.occluded) hidden[r.file] = why
     }
   }
   for (const st of stages.value) {
     for (const i of st.artifact_issues || []) {
-      if (!out[i.file]) out[i.file] = i.reason
+      if (!i.file || settled.has(i.file)) continue
+      settled.add(i.file)
+      issues[i.file] = i.reason
     }
   }
+  const ui = stages.value.find((s) => s.role === 'ui' && s.status === 'ok')
   for (const s of ui?.output?.shots || []) {
-    if (out[s.file]) continue
-    if (s.covered) bad(s.file, '画面被遮挡')
-    else if (s.readable === false) bad(s.file, '内容不清晰')
+    if (!s.file || settled.has(s.file)) continue
+    settled.add(s.file)
+    const hasIssue = (s.issues || []).length > 0
+    // covered 必须伴随具体遮挡说明（或同时不可读）才作数，避免模型误填 covered 把整批截图清空。
+    if (s.covered && (hasIssue || s.readable === false)) {
+      const why = hasIssue ? s.issues.join('；') : '画面被遮挡'
+      issues[s.file] = why
+      hidden[s.file] = why
+    } else if (s.readable === false) {
+      issues[s.file] = '内容不清晰'
+    }
   }
-  return out
+  return { issues, hidden }
 })
+const shotIssues = computed(() => shotState.value.issues)
+const hiddenShots = computed(() => shotState.value.hidden)
+// 展示计数只算真正会出现的截图。
+const shotCount = computed(() =>
+  (run.value?.artifacts || []).filter((a) => a.content_type.startsWith('image/') && !hiddenShots.value[a.name]).length,
+)
 const liveLabel = computed(() => {
   const r = run.value
   if (!r) return ''
@@ -366,14 +387,14 @@ const legacySteps = computed(() => {
 
           <!-- 截图 -->
           <section v-if="run.artifacts?.length" class="card stack" style="gap: 12px">
-            <div class="card-title"><Images :size="16" /> UI 走查截图（{{ run.artifacts.length }}）</div>
+            <div class="card-title"><Images :size="16" /> UI 走查截图（{{ shotCount }}）</div>
             <div v-if="run.pages?.length" class="pages">
               <div v-for="(p, i) in run.pages" :key="i" class="page-obs">
                 <span class="mono">{{ p.url }}</span> <b>{{ p.title }}</b>
                 <p v-if="p.observations" class="body text-2">{{ p.observations }}</p>
               </div>
             </div>
-            <ArtifactGallery :run-id="run.id" :artifacts="run.artifacts" :issues="shotIssues" />
+            <ArtifactGallery :run-id="run.id" :artifacts="run.artifacts" :issues="shotIssues" :hidden="hiddenShots" />
           </section>
 
           <!-- 计划（非等待状态） -->

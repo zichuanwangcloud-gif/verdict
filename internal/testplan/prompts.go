@@ -377,9 +377,20 @@ func writeUITask(b *strings.Builder, cfg Config, in Input, recs []StageRecord, p
 4. 文件名带语义，一看就知道这张图证明什么：ac-3-form-error.png、ac-5-empty-state.png。只用英文、数字和短横线，以 .png 结尾。
 5. 总张数不超过 12 张；超出时优先保留每条验收标准的主证据图。
 
+净场检查（每一张截图之前都必须做，用 browser_evaluate 执行，不要跳过）：
+- 先查当前画面有没有意外遮挡物：toast / 通知 / 公告条 / 引导层 / cookie 提示 / 未关闭的弹窗 / 全屏遮罩。执行：
+  [...document.querySelectorAll('[role=dialog],[aria-modal=true],dialog[open],[class*=toast],[class*=notification],[class*=message],[class*=banner],[class*=guide],[class*=cookie],[class*=mask],[class*=overlay]')].filter(el => { const r = el.getBoundingClientRect(); const cs = getComputedStyle(el); return r.width > 0 && r.height > 0 && cs.visibility !== 'hidden' && cs.display !== 'none' && Number(cs.opacity) > 0.1 }).map(el => el.tagName + '.' + String(el.className).split(' ')[0] + ' ' + Math.round(el.getBoundingClientRect().width) + 'x' + Math.round(el.getBoundingClientRect().height))
+- 有意外遮挡物：能关就关（关闭按钮 / Esc / 刷新页面）；关不掉的等它自己消失（toast 一般 3 到 5 秒）再截。仍然盖住内容的，不要截这张图，把原因写进 issues，对应验收标准判 unverifiable。
+- 遮罩 / 蒙层盖住整个页面说明还有弹窗没关，先处理弹窗；目标本身就是弹窗的，只截弹窗本身，截完关闭再截对照图。
+- 只有在上述检查返回空数组时才截图；返回非空就不要截。
+
 要求：
 1. 截图保存到环境变量 VERDICT_ARTIFACTS 指向的目录；文件名同时填进 pages[].screenshots。
-2. 每张图都要在顶层 shots 数组里登记：file（文件名）、url、state（这张图是什么界面状态）、purpose（用来证明哪条验收标准）、covered（画面是否被遮挡）、readable（内容是否清晰可辨）、issues（自检发现的问题，没有就填空数组）。没有登记的截图不算证据。
+2. 每张图都要在顶层 shots 数组里登记：file（文件名）、url、state（这张图是什么界面状态）、purpose（用来证明哪条验收标准）、covered、readable、issues。
+   - covered 指「画面里的遮挡物是否盖住了要展示的内容」：正常页面上没有遮挡物时一律填 false，不要理解成「这条验收标准已被覆盖」；只有确实被 toast、弹窗、遮罩、横幅挡住时才填 true，并在 issues 里写明被什么挡住。
+   - readable 指文字和关键区域是否清晰可辨。
+   - issues 写自检发现的问题，没有就填空数组。
+   没有登记的截图不算证据。
 3. acs 只输出你用浏览器实际验证过的条目，编号与计划一致；evidence 写清操作步骤和看到的结果，并引用截图文件名；response 填空字符串。
 4. 与验收标准无关、但确实存在的界面问题写进 findings，附复现步骤或截图文件名；不要写主观的审美意见。
 5. 浏览器工具不可用时，可以改用 playwright 脚本；都不可用时，ui 条目判 unverifiable 并说明原因。
@@ -422,7 +433,12 @@ func writeShotsTask(b *strings.Builder, recs []StageRecord, cur Result) {
 - usable：画面完整、关键区域可见、文字可辨，确实能支撑它声明的用途。
 - unusable：白屏、停在 loading / 骨架屏、被遮挡层盖住、缩放到看不清、截图错页面、与声明的状态不符。
 
-对每张图输出一条 shot_reviews：file、verdict、occluded（是否被遮挡）、readable（是否清晰可辨）、problems（具体问题）、suggest（怎么重截才能用）。
+遮挡判定（occluded）要看全图，不能只看正文区域：
+- 画面任何位置被意外遮挡物盖住关键内容（toast、通知条、弹窗、全屏遮罩、悬浮横幅、cookie 条、吸顶广告）都算 occluded，哪怕只盖住一小块或边角。
+- 遮挡物本身就是这张图要证明的对象（例如验收标准就是「出现错误提示 toast」）且没有压住其它需要展示的内容时，occluded 填 false，并在 problems 里说明「遮挡物即被验证对象」。
+- occluded 为 true 时 verdict 必须是 unusable。
+
+对每张图输出一条 shot_reviews：file、verdict、occluded、readable、problems（具体问题）、suggest（怎么重截才能用）。清单里的每一张都要有结论，不能漏。
 不要重新做验收测试，不要修改结论，也不要提审美意见。summary 用中文总结这批截图整体的可用性。
 `)
 	if cur.Shots != nil {
