@@ -16,6 +16,8 @@ const freezing = ref(false)
 const freeze = ref({ ref: '', baseline: 'core', harness: 'claude', issue_tier: 'B', case_tier: 'C', runtime_ids: [] })
 const releasing = ref(false)
 const releaseNote = ref('')
+// 添加父单时确认子单范围：不自动带入，由用户勾选。
+const addScope = ref(null)
 
 let timer
 async function load() {
@@ -43,14 +45,41 @@ const regs = computed(() => data.value?.regressions || [])
 const frozen = computed(() => v.value && v.value.status !== 'open')
 const statusTone = { open: 'info', frozen: 'warn', released: 'ok' }
 
-// 最需要注意的项排在最前：集成回归、历史回归、未通过。
-const sorted = computed(() => {
+// 父单整批的结论文案（与后端 store 一致）。
+const setOverallText = {
+  pass: '通过', partial_pass: '部分通过', partial_fail: '部分未通过',
+  fail: '未通过', partial: '部分无法验证', incomplete: '未完成',
+}
+
+// 父单和它的子单整组排序：最需要注意的项在最前，但父子不拆开。
+const grouped = computed(() => {
+  const byKey = new Map(rows.value.map((r) => [r.key, r]))
+  const rendered = new Set()
+  const groups = []
+  for (const r of rows.value) {
+    if (r.parent_identifier && byKey.has(r.parent_identifier)) continue
+    const kids = rows.value.filter((x) => x.parent_identifier === r.key)
+    groups.push({ row: r, kids })
+    rendered.add(r.key)
+    for (const c of kids) rendered.add(c.key)
+  }
+  for (const r of rows.value) if (!rendered.has(r.key)) groups.push({ row: r, kids: [] })
   const rank = (r) => (r.integration ? 0 : r.history ? 1 : 2)
-  return [...rows.value].sort((a, b) => rank(a) - rank(b))
+  const hot = (g) => Math.min(rank(g.row), ...g.kids.map(rank))
+  groups.sort((a, b) => hot(a) - hot(b))
+  const out = []
+  for (const g of groups) {
+    out.push({ ...g.row, depth: 0 })
+    for (const c of g.kids) out.push({ ...c, depth: 1 })
+  }
+  return out
 })
 
 function cellTone(c) {
   if (!c) return 'none'
+  if (c.overall) {
+    return { pass: 'ok', partial_pass: 'warn', partial_fail: 'bad', fail: 'bad', partial: 'warn', incomplete: 'live' }[c.overall] || 'none'
+  }
   if (!c.finished) return isLive({ status: c.status }) ? 'live' : 'none'
   if (c.verdict === 'pass') return 'ok'
   if (c.verdict === 'fail') return 'bad'
@@ -61,6 +90,7 @@ function cellTone(c) {
 
 function cellText(c) {
   if (!c) return '—'
+  if (c.overall) return setOverallText[c.overall] || c.overall
   if (!c.finished) return statusText[c.status] || c.status
   if (c.verdict === 'pass') return '通过'
   if (c.verdict === 'fail') return '未通过'
@@ -71,22 +101,52 @@ function cellText(c) {
 
 async function addIssue() {
   addErr.value = ''
-  if (!addKey.value.trim()) return
+  const key = addKey.value.trim()
+  if (!key) return
   try {
-    data.value = await api.addVersionIssue(props.id, addKey.value.trim(), false)
+    // 先看一眼是不是父单：是的话让用户确认本次带入哪些子单。
+    let issue = null
+    try {
+      issue = await api.issue(key)
+    } catch {
+      /* 查不到就按普通成员添加 */
+    }
+    if (issue?.children?.length) {
+      addScope.value = { issue, picked: new Set(issue.children.map((c) => c.identifier)), move: false }
+      return
+    }
+    await doAddIssue(key, null, false)
+  } catch (e) {
+    addErr.value = e.message
+  }
+}
+
+async function doAddIssue(key, scope, move) {
+  try {
+    addScope.value = null
+    data.value = await api.addVersionIssue(props.id, key, move, scope)
     addKey.value = ''
   } catch (e) {
-    if (String(e.message).includes('另一个版本') && confirm(`${e.message}\n要把它移动到这个版本吗？`)) {
-      try {
-        data.value = await api.addVersionIssue(props.id, addKey.value.trim(), true)
-        addKey.value = ''
-      } catch (e2) {
-        addErr.value = e2.message
-      }
-      return
+    if (!move && String(e.message).includes('另一个版本') && confirm(`${e.message}\n要把它移动到这个版本吗？`)) {
+      return doAddIssue(key, scope, true)
     }
     addErr.value = e.message
   }
+}
+
+function confirmAddScope() {
+  const d = addScope.value
+  if (!d) return
+  doAddIssue(d.issue.identifier || addKey.value.trim(), [...d.picked], d.move)
+}
+
+function toggleAddScope(childKey) {
+  const d = addScope.value
+  if (!d) return
+  const s = new Set(d.picked)
+  if (s.has(childKey)) s.delete(childKey)
+  else s.add(childKey)
+  d.picked = s
 }
 
 async function removeIssue(key) {
@@ -267,6 +327,27 @@ function tierOf(t) {
       <span class="hint">之后新建测试时选这个版本，测试会自动归到这里。也可以先加进来，测试结果留空。</span>
     </div>
 
+    <!-- 添加父单时确认子单范围 -->
+    <div v-if="addScope" style="position: fixed; inset: 0; background: rgba(0, 0, 0, 0.45); display: flex; align-items: center; justify-content: center; z-index: 60; padding: 16px">
+      <div class="card stack" style="max-width: 560px; width: 100%; max-height: 80vh; overflow: auto">
+        <div class="row between">
+          <h3 style="margin: 0">选择 {{ addScope.issue.identifier }} 本次带入的子单</h3>
+          <button class="btn ghost sm" @click="addScope = null">关闭</button>
+        </div>
+        <p class="hint">选中的子单会一起成为版本成员；没选的不进版本。父单会记录这次的范围，冻结回归时按它重测。</p>
+        <label v-for="c in addScope.issue.children" :key="c.identifier" class="row" style="gap: 8px; cursor: pointer">
+          <input type="checkbox" :checked="addScope.picked.has(c.identifier)" @change="toggleAddScope(c.identifier)" />
+          <span class="mono">{{ c.identifier }}</span>
+          <span>{{ c.title }}</span>
+          <span v-if="c.state" class="chip">{{ c.state }}</span>
+        </label>
+        <div class="row" style="justify-content: flex-end">
+          <button class="btn ghost" @click="addScope = null">取消</button>
+          <button class="btn primary" @click="confirmAddScope">加入版本</button>
+        </div>
+      </div>
+    </div>
+
     <div class="card flush">
       <div class="card-head" style="margin: 0; padding: 14px 16px; border-bottom: 1px solid var(--border)">
         <div class="card-title"><ShieldAlert :size="16" /> 回归矩阵</div>
@@ -287,11 +368,14 @@ function tierOf(t) {
             </tr>
           </thead>
           <tbody>
-            <tr v-for="r in sorted" :key="r.kind + r.key" :class="{ hot: r.integration || r.history }">
-              <td>
+            <tr v-for="r in grouped" :key="r.kind + r.key" :class="{ hot: r.integration || r.history }">
+              <td :style="r.depth ? 'padding-left: 30px' : null">
                 <div class="row" style="gap: 6px">
+                  <span v-if="r.depth" class="muted">↳</span>
                   <span class="issue-key">{{ r.key }}</span>
                   <span v-if="r.kind === 'case'" class="chip">{{ caseLevelText[r.level] }}</span>
+                  <span v-if="r.scope?.length" class="chip">子单 {{ r.scope.length }}</span>
+                  <span v-if="r.depth === 0 && r.parent_identifier" class="chip">属于 {{ r.parent_identifier }}</span>
                   <span v-if="r.integration" class="pill bad">集成回归</span>
                   <span v-else-if="r.history" class="pill bad">历史回归</span>
                 </div>

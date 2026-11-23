@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strings"
 
+	"verdict/internal/linear"
 	"verdict/internal/protocol"
 )
 
@@ -42,6 +43,7 @@ func buildPrompt(role string, round int, cfg Config, in Input, recs []StageRecor
 	b.WriteString("\n\n")
 
 	writeRequirement(&b, in)
+	writeIssueTree(&b, in)
 	writeRepo(&b, in)
 	if role != RolePlan {
 		b.WriteString("## 运行环境\n")
@@ -100,6 +102,85 @@ func writeRequirement(b *strings.Builder, in Input) {
 		b.WriteString("</issue_comments>\n")
 	}
 	b.WriteString("\n")
+}
+
+// writeIssueTree 给父子 issue 补测试上下文：父单拿到选中子单的清单与集成测试约束，
+// 子单知道自己在哪个父单下，避免两边验证同一批细节。
+func writeIssueTree(b *strings.Builder, in Input) {
+	if in.Issue.Parent != nil && in.Issue.Parent.Identifier != "" {
+		b.WriteString("## 所属父单\n")
+		fmt.Fprintf(b, "%s %s（汇总单；本次只验证本子单的拆分需求）\n\n", in.Issue.Parent.Identifier, in.Issue.Parent.Title)
+		return
+	}
+	if len(in.Scope) == 0 {
+		return
+	}
+	inScope := make(map[string]bool, len(in.Scope))
+	for _, k := range in.Scope {
+		inScope[k] = true
+	}
+	var selected, others []linear.ChildRef
+	for _, c := range in.Issue.Children {
+		if inScope[c.Identifier] {
+			selected = append(selected, c)
+		} else {
+			others = append(others, c)
+		}
+	}
+	// 快照里没有、但用户选了的子单（Linear 关系刚变过）也要列出来。
+	for _, k := range in.Scope {
+		found := false
+		for _, c := range in.Issue.Children {
+			if c.Identifier == k {
+				found = true
+				break
+			}
+		}
+		if !found {
+			selected = append(selected, linear.ChildRef{Identifier: k})
+		}
+	}
+	if len(selected) == 0 {
+		return
+	}
+	limit := 800
+	if len(in.Issue.Children) > 8 {
+		limit = 200
+	}
+	b.WriteString("## 子单（这是汇总单，子单已拆分实现）\n")
+	for _, c := range selected {
+		state := c.State
+		if state == "" {
+			state = "状态未知"
+		}
+		fmt.Fprintf(b, "- %s %s（%s）\n", c.Identifier, c.Title, state)
+		if d := clipRunes(c.Description, limit); d != "" {
+			fmt.Fprintf(b, "  %s\n", strings.ReplaceAll(d, "\n", "\n  "))
+		}
+	}
+	if len(others) > 0 {
+		b.WriteString("\n本次未覆盖的子单（不要验证）：")
+		for i, c := range others {
+			if i > 0 {
+				b.WriteString("、")
+			}
+			fmt.Fprintf(b, "%s %s", c.Identifier, c.Title)
+		}
+		b.WriteString("\n")
+	}
+	b.WriteString("\n本次只验证两类内容：\n")
+	b.WriteString("1. 父单验收标准里未被任何子单覆盖的部分；\n")
+	b.WriteString("2. 上述子单之间的串联、一致性、端到端流程（集成测试）。\n")
+	b.WriteString("不要重复验证子单各自的细节验收项——那些由子单测试覆盖。\n\n")
+}
+
+func clipRunes(s string, n int) string {
+	s = strings.TrimSpace(s)
+	r := []rune(s)
+	if len(r) <= n {
+		return s
+	}
+	return string(r[:n]) + "…"
 }
 
 func writeRepo(b *strings.Builder, in Input) {
@@ -206,6 +287,9 @@ func writePlanTask(b *strings.Builder, cfg Config, in Input) {
    端口一律用占位符 ${VERDICT_PORT}（第 2、3 个端口写成 ${VERDICT_PORT2}、${VERDICT_PORT3}），**不要写死 3000 这样的端口号**：平台会同时跑多个测试，写死会互相冲突。
 5. summary 用一两句话说明测试思路。
 `)
+	if len(in.Scope) > 0 {
+		b.WriteString("\n这是汇总单的集成测试：验收标准与子单重复的条目归到子单，只保留跨子单的组合条件与父单独有的要求。\n")
+	}
 	if !cfg.BriefPlan {
 		b.WriteString(dataIsolationRules(in.RunID))
 	}

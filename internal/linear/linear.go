@@ -26,13 +26,33 @@ type Comment struct {
 	CreatedAt string `json:"created_at"`
 }
 
+// ParentRef 是 issue 的父单（Linear 的 parent 字段）。
+type ParentRef struct {
+	ID         string `json:"id"`
+	Identifier string `json:"identifier"`
+	Title      string `json:"title"`
+}
+
+// ChildRef 是 issue 的子单（Linear 的 children 字段）。
+type ChildRef struct {
+	ID         string `json:"id"`
+	Identifier string `json:"identifier"`
+	Title      string `json:"title"`
+	State      string `json:"state,omitempty"`
+	StateType  string `json:"state_type,omitempty"`
+	// Description 只在父单测试的 run 快照里补充（建测试时拉一次），看板查询不取。
+	Description string `json:"description,omitempty"`
+}
+
 type Issue struct {
-	ID          string    `json:"id"` // Linear 内部 UUID，发评论用
-	Identifier  string    `json:"identifier"`
-	Title       string    `json:"title"`
-	Description string    `json:"description"`
-	URL         string    `json:"url"`
-	Comments    []Comment `json:"comments"`
+	ID          string     `json:"id"` // Linear 内部 UUID，发评论用
+	Identifier  string     `json:"identifier"`
+	Title       string     `json:"title"`
+	Description string     `json:"description"`
+	URL         string     `json:"url"`
+	Comments    []Comment  `json:"comments"`
+	Parent      *ParentRef `json:"parent,omitempty"`
+	Children    []ChildRef `json:"children,omitempty"`
 }
 
 type Client struct {
@@ -118,6 +138,9 @@ type IssueSummary struct {
 	Mine       bool   `json:"mine"`
 	UpdatedAt  string `json:"updated_at"`
 	URL        string `json:"url"`
+	// Parent 不为空表示这是子单；Children 是被拆分出来的子单（最多取 100 个）。
+	Parent   *ParentRef `json:"parent,omitempty"`
+	Children []ChildRef `json:"children,omitempty"`
 }
 
 // 搜 issue 时一次最多返回多少条（Linear 的 first 上限是 250）。
@@ -291,6 +314,22 @@ type issueNode = struct {
 		ID          string `json:"id"`
 		DisplayName string `json:"displayName"`
 	} `json:"assignee"`
+	Parent *struct {
+		ID         string `json:"id"`
+		Identifier string `json:"identifier"`
+		Title      string `json:"title"`
+	} `json:"parent"`
+	Children struct {
+		Nodes []struct {
+			ID         string `json:"id"`
+			Identifier string `json:"identifier"`
+			Title      string `json:"title"`
+			State      *struct {
+				Name string `json:"name"`
+				Type string `json:"type"`
+			} `json:"state"`
+		} `json:"nodes"`
+	} `json:"children"`
 }
 
 func toSummary(n issueNode) IssueSummary {
@@ -304,6 +343,16 @@ func toSummary(n issueNode) IssueSummary {
 	if n.Assignee != nil {
 		s.Assignee, s.AssigneeID = n.Assignee.DisplayName, n.Assignee.ID
 	}
+	if n.Parent != nil {
+		s.Parent = &ParentRef{ID: n.Parent.ID, Identifier: n.Parent.Identifier, Title: n.Parent.Title}
+	}
+	for _, c := range n.Children.Nodes {
+		ch := ChildRef{ID: c.ID, Identifier: c.Identifier, Title: c.Title}
+		if c.State != nil {
+			ch.State, ch.StateType = c.State.Name, c.State.Type
+		}
+		s.Children = append(s.Children, ch)
+	}
 	return s
 }
 
@@ -311,7 +360,9 @@ func toSummary(n issueNode) IssueSummary {
 func (c *Client) listIssues(ctx context.Context, filter map[string]any, limit int) ([]IssueSummary, error) {
 	const q = `query($filter: IssueFilter, $first: Int) {
   issues(filter: $filter, first: $first, orderBy: updatedAt) {
-    nodes { id identifier title url updatedAt state { name } team { name key } assignee { id displayName } }
+    nodes { id identifier title url updatedAt state { name } team { name key } assignee { id displayName }
+      parent { id identifier title }
+      children(first: 100) { nodes { id identifier title state { name type } } } }
   }
 }`
 	var out struct {
@@ -333,7 +384,9 @@ func (c *Client) listIssues(ctx context.Context, filter map[string]any, limit in
 func (c *Client) searchIssues(ctx context.Context, term string, limit int) ([]IssueSummary, error) {
 	const q = `query($term: String!, $first: Int) {
   searchIssues(term: $term, first: $first) {
-    nodes { id identifier title url updatedAt state { name } team { name key } assignee { id displayName } }
+    nodes { id identifier title url updatedAt state { name } team { name key } assignee { id displayName }
+      parent { id identifier title }
+      children(first: 100) { nodes { id identifier title state { name type } } } }
   }
 }`
 	var out struct {
@@ -356,6 +409,8 @@ func (c *Client) GetIssue(ctx context.Context, key string) (Issue, error) {
 	const q = `query($id: String!) {
   issue(id: $id) {
     id identifier title description url
+    parent { id identifier title }
+    children(first: 100) { nodes { id identifier title state { name type } } }
     comments(first: 100) { nodes { body createdAt user { name } } }
   }
 }`
@@ -366,7 +421,23 @@ func (c *Client) GetIssue(ctx context.Context, key string) (Issue, error) {
 			Title       string `json:"title"`
 			Description string `json:"description"`
 			URL         string `json:"url"`
-			Comments    struct {
+			Parent      *struct {
+				ID         string `json:"id"`
+				Identifier string `json:"identifier"`
+				Title      string `json:"title"`
+			} `json:"parent"`
+			Children struct {
+				Nodes []struct {
+					ID         string `json:"id"`
+					Identifier string `json:"identifier"`
+					Title      string `json:"title"`
+					State      *struct {
+						Name string `json:"name"`
+						Type string `json:"type"`
+					} `json:"state"`
+				} `json:"nodes"`
+			} `json:"children"`
+			Comments struct {
 				Nodes []struct {
 					Body      string `json:"body"`
 					CreatedAt string `json:"createdAt"`
@@ -385,6 +456,16 @@ func (c *Client) GetIssue(ctx context.Context, key string) (Issue, error) {
 	}
 	is := Issue{ID: out.Issue.ID, Identifier: out.Issue.Identifier, Title: out.Issue.Title,
 		Description: out.Issue.Description, URL: out.Issue.URL}
+	if out.Issue.Parent != nil {
+		is.Parent = &ParentRef{ID: out.Issue.Parent.ID, Identifier: out.Issue.Parent.Identifier, Title: out.Issue.Parent.Title}
+	}
+	for _, c := range out.Issue.Children.Nodes {
+		ch := ChildRef{ID: c.ID, Identifier: c.Identifier, Title: c.Title}
+		if c.State != nil {
+			ch.State, ch.StateType = c.State.Name, c.State.Type
+		}
+		is.Children = append(is.Children, ch)
+	}
 	for _, n := range out.Issue.Comments.Nodes {
 		author := "（未知）"
 		if n.User != nil {

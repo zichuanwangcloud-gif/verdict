@@ -83,6 +83,8 @@ type Input struct {
 	// 回归测试：锁定的 commit，以及计划复用的来源测试（平台会预先写入计划阶段）。
 	Commit     string
 	PlanSource string
+	// Scope 是父单测试本次选中的子单编号；为空表示普通测试，或父单这次没带子单。
+	Scope []string
 }
 
 // 下一步动作。

@@ -111,3 +111,50 @@ func TestStagesLifecycle(t *testing.T) {
 		t.Fatal("终态不应被覆盖")
 	}
 }
+
+// 主子 issue 的列在旧库和新库上都要存在，且重复打开幂等。
+func TestMigrateIssueTreeColumns(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "tree.db")
+	st, err := Open(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string][]string{
+		"runs":           {"set_id", "issue_parent_key", "scope"},
+		"cases":          {"scope"},
+		"version_issues": {"scope"},
+	}
+	for table, cols := range want {
+		have := columnsOf(t, st, table)
+		for _, c := range cols {
+			if !have[c] {
+				t.Errorf("%s 缺少列 %s", table, c)
+			}
+		}
+	}
+	st.Close()
+
+	st2, err := Open(p)
+	if err != nil {
+		t.Fatalf("重复打开失败: %v", err)
+	}
+	st2.Close()
+}
+
+func columnsOf(t *testing.T, st *Store, table string) map[string]bool {
+	t.Helper()
+	rows, err := st.db.Query(`SELECT name FROM pragma_table_info(?)`, table)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	out := map[string]bool{}
+	for rows.Next() {
+		var n string
+		if err := rows.Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		out[n] = true
+	}
+	return out
+}

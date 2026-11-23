@@ -33,7 +33,14 @@ func (s *Server) writeBackForce(runID string, force bool) {
 		return
 	}
 	stages, _ := s.st.Stages(ctx, runID)
-	url, err := linearClient(key).CreateComment(ctx, run.Issue.ID, CommentBody(run, stages, s.publicURL(ctx, nil)))
+	body := CommentBody(run, stages, s.publicURL(ctx, nil))
+	// 父单（批次里没有父单编号的那条）多一段子单汇总，子单各写各的。
+	if run.SetID != "" && run.IssueParentKey == "" {
+		if sm, err := s.st.SetSummary(ctx, runID); err == nil {
+			body = appendSetSummary(body, sm)
+		}
+	}
+	url, err := linearClient(key).CreateComment(ctx, run.Issue.ID, body)
 	msg := ""
 	if err != nil {
 		msg = err.Error()
@@ -136,6 +143,53 @@ func unusableShots(stages []store.Stage) []string {
 		}
 	}
 	return files
+}
+
+// setVerdictText 是父单整体结论的文案。
+var setVerdictText = map[string]string{
+	store.SetPass:        "✅ 通过",
+	store.SetPartialPass: "🟡 部分通过",
+	store.SetPartialFail: "🔴 部分未通过",
+	store.SetFail:        "❌ 未通过",
+	store.SetPartial:     "⚠️ 部分无法验证",
+	store.SetIncomplete:  "⏳ 未完成",
+}
+
+// appendSetSummary 在父单评论末尾追加子单汇总表；子单的明细仍在各自的评论里。
+func appendSetSummary(body string, sm store.IssueSetSummary) string {
+	var b strings.Builder
+	b.WriteString(body)
+	b.WriteString("\n\n### 子单汇总\n\n")
+	fmt.Fprintf(&b, "**父单整体结论：%s**（覆盖 %d/%d 个子单）\n\n",
+		setVerdictText[sm.Overall], len(sm.Children), len(sm.Children)+len(sm.Uncovered))
+	if len(sm.Children) > 0 {
+		b.WriteString("| 子单 | 结论 |\n|---|---|\n")
+		for _, c := range sm.Children {
+			state := setVerdictText[c.Verdict]
+			switch {
+			case c.Missing:
+				state = "未创建"
+			case c.Verdict == "":
+				state = "未完成"
+			}
+			name := c.IssueKey
+			if c.Title != "" {
+				name += " " + mdCell(c.Title)
+			}
+			fmt.Fprintf(&b, "| %s | %s |\n", mdCell(name), state)
+		}
+	}
+	if len(sm.Uncovered) > 0 {
+		b.WriteString("\n未覆盖：")
+		for i, c := range sm.Uncovered {
+			if i > 0 {
+				b.WriteString("、")
+			}
+			b.WriteString(c.Identifier)
+		}
+		b.WriteString("\n")
+	}
+	return b.String()
 }
 
 // CommentBody 生成回写到 Linear 的评论（Markdown）。

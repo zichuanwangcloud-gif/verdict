@@ -164,6 +164,25 @@ function toggle(id) {
 const acIcon = { pass: CircleCheck, fail: CircleX, unverifiable: CircleHelp, disputed: Scale }
 const sevTone = { critical: 'bad', high: 'bad', medium: 'warn', low: '' }
 
+// 父单整批的结论：四个状态 + 未完成（与后端 store 的取值一致）。
+const setVerdictText = {
+  pass: '通过', partial_pass: '部分通过', partial_fail: '部分未通过',
+  fail: '未通过', partial: '部分无法验证', incomplete: '未完成',
+}
+const setVerdictTone = {
+  pass: 'ok', partial_pass: 'warn', partial_fail: 'bad', fail: 'bad', partial: 'warn', incomplete: 'info',
+}
+
+function childText(c) {
+  if (c.missing) return '未创建'
+  if (!c.verdict) return c.status === 'completed' ? '无结论' : '未完成'
+  return { pass: '通过', fail: '未通过', partial: '部分无法验证' }[c.verdict] || c.verdict
+}
+function childTone(c) {
+  if (c.missing || !c.verdict) return 'warn'
+  return { pass: 'ok', fail: 'bad', partial: 'warn' }[c.verdict] || ''
+}
+
 // 旧版测试（单阶段）的进度条
 const legacySteps = computed(() => {
   const s = run.value?.status
@@ -229,6 +248,7 @@ const legacySteps = computed(() => {
         </div>
       </div>
       <div v-if="run.parent_run_id" class="alert warn"><PlayCircle :size="16" /><span>这条测试续跑自 <a :href="'/runs/' + run.parent_run_id" @click.prevent="go('/runs/' + run.parent_run_id)">{{ run.parent_run_id }}</a>，已完成的阶段不会重跑。</span></div>
+      <div v-if="run.set_parent_run_id" class="alert ok"><Layers :size="16" /><span>这是一次子单测试，属于父单批次 <a :href="'/runs/' + run.set_parent_run_id" @click.prevent="go('/runs/' + run.set_parent_run_id)">查看父单汇总</a>。</span></div>
       <div v-if="run.findings?.some((f) => f.severity === 'critical' || f.severity === 'high')" class="alert bad">
         <Bug :size="16" />
         <span class="body">另外发现 {{ run.findings.filter((f) => f.severity === 'critical' || f.severity === 'high').length }} 个严重/高危问题（不影响验收结论），见下方「额外发现」。</span>
@@ -243,6 +263,33 @@ const legacySteps = computed(() => {
           </details>
         </div>
       </div>
+
+      <!-- 父单：子单矩阵与整体结论 -->
+      <section v-if="run.set_summary" class="card stack" style="gap: 12px">
+        <div class="card-head" style="margin: 0">
+          <div class="card-title"><Layers :size="16" /> 子单汇总</div>
+          <span class="pill" :class="setVerdictTone[run.set_summary.overall] || ''">{{ setVerdictText[run.set_summary.overall] || run.set_summary.overall }}</span>
+        </div>
+        <p class="hint">
+          父单只验证汇总要求与子单之间的集成；子单细节在各自报告里。覆盖
+          {{ run.set_summary.children.length }}/{{ run.set_summary.children.length + (run.set_summary.uncovered || []).length }} 个子单。
+        </p>
+        <p v-if="!run.issue?.description?.trim()" class="hint">父单没有独立需求描述，整体结论仅来自集成验证与子单汇总。</p>
+        <div v-for="c in run.set_summary.children" :key="c.issue_key" class="row between" style="gap: 8px; padding: 8px 0; border-top: 1px solid var(--line)">
+          <div class="row" style="gap: 8px; min-width: 0">
+            <span class="issue-key">{{ c.issue_key }}</span>
+            <span class="muted" style="min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap">{{ c.title }}</span>
+          </div>
+          <div class="row" style="gap: 8px">
+            <span class="pill" :class="childTone(c)">{{ childText(c) }}</span>
+            <a v-if="c.run_id" class="chip" :href="'/runs/' + c.run_id" @click.prevent="go('/runs/' + c.run_id)">报告</a>
+            <span v-else class="muted" style="font-size: 12px">未创建</span>
+          </div>
+        </div>
+        <div v-if="(run.set_summary.uncovered || []).length" class="hint">
+          未覆盖：{{ run.set_summary.uncovered.map((c) => c.identifier).join('、') }}
+        </div>
+      </section>
 
       <div :class="{ 'report-grid': stages.length }">
         <div class="stack" style="gap: 20px; min-width: 0">
