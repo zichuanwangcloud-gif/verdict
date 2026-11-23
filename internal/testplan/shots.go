@@ -73,8 +73,14 @@ func shotVerdict(recs []StageRecord) map[string]string {
 			if f == "" || settled[f] {
 				continue
 			}
-			if s.Covered {
-				bad[f] = "画面被遮挡"
+			// covered 单独为真不算数：模型常把它误读成「这条已被覆盖」，
+			// 必须在 issues 里写清遮挡物、或同时判定不可读，才视为真的被遮挡。
+			if s.Covered && (len(s.Issues) > 0 || !s.Readable) {
+				if len(s.Issues) > 0 {
+					bad[f] = "画面被遮挡：" + strings.Join(s.Issues, "；")
+				} else {
+					bad[f] = "画面被遮挡"
+				}
 			} else if !s.Readable {
 				bad[f] = "内容不清晰"
 			}

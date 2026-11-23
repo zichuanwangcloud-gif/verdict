@@ -369,6 +369,8 @@ func schemaFor(role string) json.RawMessage {
 		return PlanSchema
 	case RoleUI:
 		return UISchema
+	case RoleShots:
+		return ShotsSchema
 	case RoleRed:
 		return RedSchema
 	case RoleExplore:
