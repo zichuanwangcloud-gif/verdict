@@ -72,6 +72,9 @@ func (s *Server) issueBoard(w http.ResponseWriter, r *http.Request) {
 	keys := make([]string, 0, len(list))
 	for _, it := range list {
 		keys = append(keys, it.Identifier)
+		for _, c := range it.Children {
+			keys = append(keys, c.Identifier)
+		}
 	}
 	last, err := s.st.LastRunsByIssue(r.Context(), repoID, keys)
 	if err != nil {
@@ -81,7 +84,10 @@ func (s *Server) issueBoard(w http.ResponseWriter, r *http.Request) {
 
 	type row struct {
 		linear.BoardIssue
-		LastRun *store.IssueRunBrief `json:"last_run"`
+		ParentIdentifier string               `json:"parent_identifier,omitempty"`
+		ParentTitle      string               `json:"parent_title,omitempty"`
+		ChildCount       int                  `json:"child_count"`
+		LastRun          *store.IssueRunBrief `json:"last_run"`
 	}
 	// 顺带查出每行最近一次测试的人工真值，行内才好标「已复核 / 待复核」。
 	runIDs := make([]string, 0, len(list))
@@ -89,15 +95,35 @@ func (s *Server) issueBoard(w http.ResponseWriter, r *http.Request) {
 		if b, found := last[it.Identifier]; found {
 			runIDs = append(runIDs, b.RunID)
 		}
+		for _, c := range it.Children {
+			if b, found := last[c.Identifier]; found {
+				runIDs = append(runIDs, b.RunID)
+			}
+		}
 	}
 	truths, err := s.st.TruthsFor(r.Context(), runIDs)
 	if err != nil {
 		failErr(w, err)
 		return
 	}
+	// 子单最近一次测试单独给一份，展开父单时前端不用再逐条查。
+	childRuns := map[string]store.IssueRunBrief{}
+	for _, it := range list {
+		for _, c := range it.Children {
+			if b, found := last[c.Identifier]; found {
+				if t, ok := truths[b.RunID]; ok {
+					b.Truth = &t
+				}
+				childRuns[c.Identifier] = b
+			}
+		}
+	}
 	rows := make([]row, 0, len(list))
 	for _, it := range list {
-		rw := row{BoardIssue: it}
+		rw := row{BoardIssue: it, ChildCount: len(it.Children)}
+		if it.Parent != nil {
+			rw.ParentIdentifier, rw.ParentTitle = it.Parent.Identifier, it.Parent.Title
+		}
 		if b, found := last[it.Identifier]; found {
 			rw.LastRun = &b
 			if t, ok := truths[b.RunID]; ok {
@@ -106,7 +132,7 @@ func (s *Server) issueBoard(w http.ResponseWriter, r *http.Request) {
 		}
 		rows = append(rows, rw)
 	}
-	ok(w, map[string]any{"issues": rows, "repo_id": repoID})
+	ok(w, map[string]any{"issues": rows, "repo_id": repoID, "children_runs": childRuns})
 }
 
 // batchRunInput 是一次给多个 issue 排测试。仓库、分支、档位等统一给，节省逐条配置。
@@ -121,6 +147,8 @@ type batchRunInput struct {
 	ApprovePlan *bool            `json:"approve_plan"`
 	MaxMinutes  int              `json:"max_minutes"`
 	MaxCostUSD  *float64         `json:"max_cost_usd"`
+	// ChildScope 按父单编号给出本次选中的子单；没列出的父单按普通测试处理。
+	ChildScope map[string][]string `json:"child_scope"`
 }
 
 // batchResult 是批量启动里单条的结果。单条失败不影响其余条目。
@@ -166,6 +194,7 @@ func (s *Server) startBatchRuns(w http.ResponseWriter, r *http.Request) {
 		run, code, err := s.startRun(r.Context(), runInput{
 			IssueKey: key, RepoID: in.RepoID, Branch: in.Branch, RuntimeID: in.RuntimeID, Harness: in.Harness,
 			Tier: in.Tier, Config: in.Config, ApprovePlan: in.ApprovePlan, MaxMinutes: in.MaxMinutes, MaxCostUSD: in.MaxCostUSD,
+			ChildScope: in.ChildScope[key],
 		})
 		if err != nil {
 			msg := err.Error()

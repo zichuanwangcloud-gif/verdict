@@ -172,11 +172,13 @@ type VersionIssue struct {
 	VersionID int64        `json:"version_id"`
 	IssueKey  string       `json:"issue_key"`
 	Issue     linear.Issue `json:"issue"`
-	AddedAt   *time.Time   `json:"added_at"`
+	// Scope 是父单成员在版本里覆盖的子单；子单成员为空。
+	Scope   []string   `json:"scope,omitempty"`
+	AddedAt *time.Time `json:"added_at"`
 }
 
 func (s *Store) VersionIssues(ctx context.Context, versionID int64) ([]VersionIssue, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT version_id, issue_key, issue, added_at FROM version_issues WHERE version_id=? ORDER BY added_at, issue_key`, versionID)
+	rows, err := s.db.QueryContext(ctx, `SELECT version_id, issue_key, issue, scope, added_at FROM version_issues WHERE version_id=? ORDER BY added_at, issue_key`, versionID)
 	if err != nil {
 		return nil, err
 	}
@@ -184,11 +186,12 @@ func (s *Store) VersionIssues(ctx context.Context, versionID int64) ([]VersionIs
 	out := []VersionIssue{}
 	for rows.Next() {
 		var vi VersionIssue
-		var issue, added string
-		if err := rows.Scan(&vi.VersionID, &vi.IssueKey, &issue, &added); err != nil {
+		var issue, scope, added string
+		if err := rows.Scan(&vi.VersionID, &vi.IssueKey, &issue, &scope, &added); err != nil {
 			return nil, err
 		}
 		_ = json.Unmarshal([]byte(issue), &vi.Issue)
+		_ = json.Unmarshal([]byte(scope), &vi.Scope)
 		vi.AddedAt = parseTime(added)
 		out = append(out, vi)
 	}
@@ -207,7 +210,8 @@ func (s *Store) IssueVersion(ctx context.Context, repoID int64, issueKey string)
 
 // AddVersionIssue 把 issue 加入版本（已在本版本时更新快照）。issue 在同仓库的另一个版本里时，
 // move=false 返回 ErrIssueInOtherVersion，move=true 则移动过来（已发布版本里的不能移动）。
-func (s *Store) AddVersionIssue(ctx context.Context, v Version, issue linear.Issue, move bool) error {
+// scope 非 nil 时一起更新父单覆盖的子单范围。
+func (s *Store) AddVersionIssue(ctx context.Context, v Version, issue linear.Issue, scope []string, move bool) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -222,7 +226,12 @@ func (s *Store) AddVersionIssue(ctx context.Context, v Version, issue linear.Iss
 	case err != nil:
 		return err
 	case cur == v.ID:
-		_, err = tx.ExecContext(ctx, `UPDATE version_issues SET issue=? WHERE version_id=? AND issue_key=?`, toJSON(issue), v.ID, issue.Identifier)
+		if scope != nil {
+			_, err = tx.ExecContext(ctx, `UPDATE version_issues SET issue=?, scope=? WHERE version_id=? AND issue_key=?`,
+				toJSON(issue), toJSON(scope), v.ID, issue.Identifier)
+		} else {
+			_, err = tx.ExecContext(ctx, `UPDATE version_issues SET issue=? WHERE version_id=? AND issue_key=?`, toJSON(issue), v.ID, issue.Identifier)
+		}
 		if err != nil {
 			return err
 		}
@@ -242,8 +251,12 @@ func (s *Store) AddVersionIssue(ctx context.Context, v Version, issue linear.Iss
 			return err
 		}
 	}
-	if _, err := tx.ExecContext(ctx, `INSERT INTO version_issues(version_id, repo_id, issue_key, issue, added_at) VALUES(?,?,?,?,?)`,
-		v.ID, v.RepoID, issue.Identifier, toJSON(issue), now()); err != nil {
+	scopeJSON := toJSON(scope)
+	if scope == nil {
+		scopeJSON = "[]"
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO version_issues(version_id, repo_id, issue_key, issue, scope, added_at) VALUES(?,?,?,?,?,?)`,
+		v.ID, v.RepoID, issue.Identifier, toJSON(issue), scopeJSON, now()); err != nil {
 		return err
 	}
 	return tx.Commit()
@@ -541,20 +554,23 @@ type Case struct {
 	Level           string         `json:"level"`
 	Status          string         `json:"status"`
 	RetiredReason   string         `json:"retired_reason"`
-	CreatedAt       *time.Time     `json:"created_at"`
-	UpdatedAt       *time.Time     `json:"updated_at"`
+	// Scope 是父单用例覆盖的子单范围；子单用例为空。
+	Scope     []string   `json:"scope,omitempty"`
+	CreatedAt *time.Time `json:"created_at"`
+	UpdatedAt *time.Time `json:"updated_at"`
 }
 
-const caseCols = `id, repo_id, issue_key, issue, plan, source_run_id, source_version_id, level, status, retired_reason, created_at, updated_at`
+const caseCols = `id, repo_id, issue_key, issue, plan, source_run_id, source_version_id, level, status, retired_reason, scope, created_at, updated_at`
 
 func scanCase(sc interface{ Scan(...any) error }) (Case, error) {
 	var c Case
-	var issue, plan, created, updated string
-	err := sc.Scan(&c.ID, &c.RepoID, &c.IssueKey, &issue, &plan, &c.SourceRunID, &c.SourceVersionID, &c.Level, &c.Status, &c.RetiredReason, &created, &updated)
+	var issue, plan, scope, created, updated string
+	err := sc.Scan(&c.ID, &c.RepoID, &c.IssueKey, &issue, &plan, &c.SourceRunID, &c.SourceVersionID, &c.Level, &c.Status, &c.RetiredReason, &scope, &created, &updated)
 	_ = json.Unmarshal([]byte(issue), &c.Issue)
 	if plan != "" {
 		_ = json.Unmarshal([]byte(plan), &c.Plan)
 	}
+	_ = json.Unmarshal([]byte(scope), &c.Scope)
 	c.CreatedAt, c.UpdatedAt = parseTime(created), parseTime(updated)
 	return c, err
 }
@@ -613,12 +629,16 @@ func (s *Store) UpsertCase(ctx context.Context, c Case, action, detail string) (
 		level = CaseNormal
 	}
 	t := now()
-	if _, err := tx.ExecContext(ctx, `INSERT INTO cases(repo_id, issue_key, issue, plan, source_run_id, source_version_id, level, status, created_at, updated_at)
- VALUES(?,?,?,?,?,?,?,?,?,?)
+	scope := toJSON(c.Scope)
+	if c.Scope == nil {
+		scope = "[]"
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO cases(repo_id, issue_key, issue, plan, source_run_id, source_version_id, level, status, scope, created_at, updated_at)
+ VALUES(?,?,?,?,?,?,?,?,?,?,?)
  ON CONFLICT(repo_id, issue_key) DO UPDATE SET issue=excluded.issue, plan=excluded.plan, source_run_id=excluded.source_run_id,
- source_version_id=excluded.source_version_id, status=excluded.status, retired_reason='', updated_at=excluded.updated_at`+
+ source_version_id=excluded.source_version_id, status=excluded.status, retired_reason='', scope=excluded.scope, updated_at=excluded.updated_at`+
 		map[bool]string{true: `, level=excluded.level`, false: ``}[c.Level != ""],
-		c.RepoID, c.IssueKey, toJSON(c.Issue), plan, c.SourceRunID, c.SourceVersionID, level, CaseActive, t, t); err != nil {
+		c.RepoID, c.IssueKey, toJSON(c.Issue), plan, c.SourceRunID, c.SourceVersionID, level, CaseActive, scope, t, t); err != nil {
 		return Case{}, err
 	}
 	var id int64

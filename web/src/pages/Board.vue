@@ -28,6 +28,9 @@ const filter = ref({ team: '', states: [], assignee: 'all', q: '' })
 
 const selected = ref(new Set())
 const busy = ref(false)
+// 父单分组的折叠状态，以及测试父单前确认子单范围的弹窗。
+const collapsed = ref(new Set())
+const scopeDialog = ref(null)
 
 let timer
 onMounted(async () => {
@@ -225,12 +228,12 @@ function running(r) {
 
 const launchable = computed(() => rows.value.filter((r) => selected.value.has(r.identifier) && !running(r)))
 
-async function launch(keys) {
+async function launch(keys, childScope = {}) {
   if (!configReady.value || !keys.length) return
   busy.value = true
   err.value = ''
   try {
-    const res = await api.startBatchRuns({
+    const payload = {
       issue_keys: keys,
       repo_id: Number(cfg.value.repo_id),
       branch: cfg.value.branch.trim(),
@@ -240,7 +243,9 @@ async function launch(keys) {
       approve_plan: !!cfg.value.approve_plan,
       max_minutes: Number(cfg.value.max_minutes) || 0,
       max_cost_usd: cfg.value.max_cost_usd === '' || cfg.value.max_cost_usd == null ? 0 : Number(cfg.value.max_cost_usd),
-    })
+    }
+    if (Object.keys(childScope).length) payload.child_scope = childScope
+    const res = await api.startBatchRuns(payload)
     const next = { ...launched.value }
     let started = 0
     for (const r of res.results || []) {
@@ -264,7 +269,85 @@ function launchOne(r) {
     go('/runs/' + lastRun(r).run_id)
     return
   }
-  launch([r.identifier])
+  startRows([r.identifier])
+}
+
+// ---- 主子 issue ----
+
+// 父单下、在当前筛选结果里的子单。
+function childKeys(key) {
+  return rows.value.filter((r) => r.parent_identifier === key)
+}
+
+// 父单带子单展示：父单行 + 缩进的子单行。父单没命中筛选时，子单按顶级行显示并标出所属父单。
+const displayRows = computed(() => {
+  const byKey = new Map(rows.value.map((r) => [r.identifier, r]))
+  const out = []
+  const rendered = new Set()
+  for (const r of rows.value) {
+    if (r.parent_identifier && byKey.has(r.parent_identifier)) continue
+    out.push({ row: r, depth: 0 })
+    rendered.add(r.identifier)
+    const kids = childKeys(r.identifier)
+    if (kids.length) {
+      for (const c of kids) {
+        rendered.add(c.identifier)
+        if (!collapsed.value.has(r.identifier)) out.push({ row: c, depth: 1 })
+      }
+    }
+  }
+  for (const r of rows.value) if (!rendered.has(r.identifier)) out.push({ row: r, depth: 0 })
+  return out
+})
+
+function toggleCollapse(key) {
+  const s = new Set(collapsed.value)
+  if (s.has(key)) s.delete(key)
+  else s.add(key)
+  collapsed.value = s
+}
+
+// 启动前确认父单的子单范围：勾父单不自动带子单。
+function startRows(keys) {
+  const parents = rows.value.filter((r) => keys.includes(r.identifier) && (r.children || []).length > 0)
+  if (!parents.length) {
+    launch(keys, {})
+    return
+  }
+  const picked = {}
+  for (const p of parents) picked[p.identifier] = new Set(p.children.map((c) => c.identifier))
+  scopeDialog.value = { parents, picked, pendingKeys: keys }
+}
+
+function toggleScope(parentKey, childKey) {
+  const d = scopeDialog.value
+  if (!d) return
+  const s = new Set(d.picked[parentKey])
+  if (s.has(childKey)) s.delete(childKey)
+  else s.add(childKey)
+  d.picked = { ...d.picked, [parentKey]: s }
+}
+
+function allScoped(parentKey) {
+  const d = scopeDialog.value
+  const p = d?.parents.find((x) => x.identifier === parentKey)
+  return p ? p.children.every((c) => d.picked[parentKey].has(c.identifier)) : false
+}
+
+function toggleScopeAll(parentKey) {
+  const d = scopeDialog.value
+  if (!d) return
+  const p = d.parents.find((x) => x.identifier === parentKey)
+  d.picked = { ...d.picked, [parentKey]: allScoped(parentKey) ? new Set() : new Set(p.children.map((c) => c.identifier)) }
+}
+
+function confirmScope() {
+  const d = scopeDialog.value
+  if (!d) return
+  const scope = {}
+  for (const p of d.parents) scope[p.identifier] = [...d.picked[p.identifier]]
+  scopeDialog.value = null
+  launch(d.pendingKeys, scope)
 }
 
 function openLast(r) {
@@ -310,7 +393,7 @@ const acOk = (acs) => (acs || []).filter((a) => a.status === 'pass').length
       <div class="row">
         <button class="btn ghost" :disabled="loading" @click="load"><RefreshCw :size="15" :class="{ spin: loading }" /> 刷新</button>
         <button class="btn" :disabled="!configReady || saving" @click="saveDefaults(false)">记住配置</button>
-        <button class="btn primary" :disabled="!configReady || !launchable.length || busy" @click="launch(launchable.map((r) => r.identifier))">
+        <button class="btn primary" :disabled="!configReady || !launchable.length || busy" @click="startRows(launchable.map((r) => r.identifier))">
           <Play :size="15" /> {{ busy ? '启动中…' : `测试选中${launchable.length ? '（' + launchable.length + '）' : ''}` }}
         </button>
       </div>
@@ -422,16 +505,18 @@ const acOk = (acs) => (acs || []).filter((a) => a.status === 'pass').length
       </div>
 
       <div v-else class="board-list">
-        <div v-for="r in rows" :key="r.identifier" class="board-row" :class="{ picked: selected.has(r.identifier) }">
+        <div v-for="({ row: r, depth }) in displayRows" :key="r.identifier" class="board-row" :class="{ picked: selected.has(r.identifier) }" :style="depth > 0 ? { paddingLeft: '42px' } : null">
           <input type="checkbox" :checked="selected.has(r.identifier)" @change="toggleSelect(r.identifier)" />
 
           <div class="board-main">
             <div class="row" style="gap: 8px; flex-wrap: wrap">
+              <span v-if="depth > 0" class="muted">↳</span>
               <a :href="r.url" target="_blank" rel="noopener" class="issue-key">{{ r.identifier }}</a>
               <span class="run-title" style="flex: 1; min-width: 0">{{ r.title }}</span>
             </div>
             <div class="row board-meta">
               <span v-if="r.state" class="state-dot" :class="stateTone[r.state_type]">{{ r.state }}</span>
+              <span v-if="depth === 0 && r.parent_identifier" class="chip">属于 {{ r.parent_identifier }}</span>
               <span v-if="r.mine" class="chip mine"><UserRound :size="11" /> 我的</span>
               <span v-else-if="r.assignee" class="chip"><Users :size="11" /> {{ r.assignee }}</span>
               <span v-for="l in (r.labels || []).slice(0, 3)" :key="l" class="chip">{{ l }}</span>
@@ -458,11 +543,42 @@ const acOk = (acs) => (acs || []).filter((a) => a.status === 'pass').length
           </div>
 
           <div class="board-act">
+            <button v-if="depth === 0 && childKeys(r.identifier).length" class="btn sm ghost" @click="toggleCollapse(r.identifier)">
+              <ChevronRight :size="14" :style="collapsed.has(r.identifier) ? 'transform: rotate(-90deg)' : 'transform: rotate(90deg)'" />
+              {{ collapsed.has(r.identifier) ? '展开' : '收起' }} {{ childKeys(r.identifier).length }}
+            </button>
             <button v-if="running(r)" class="btn sm" @click="openLast(r)"><ChevronRight :size="14" /> 查看</button>
             <button v-else class="btn sm primary" :disabled="!configReady || busy" :title="configReady ? '' : '先选好仓库、分支和运行时'" @click="launchOne(r)">
               <Play :size="14" /> 开始测试
             </button>
           </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- 父单测试前确认子单范围 -->
+    <div v-if="scopeDialog" style="position: fixed; inset: 0; background: rgba(0, 0, 0, 0.45); display: flex; align-items: center; justify-content: center; z-index: 60; padding: 16px">
+      <div class="card stack" style="max-width: 620px; width: 100%; max-height: 82vh; overflow: auto">
+        <div class="row between">
+          <h3 style="margin: 0">选择父单本次覆盖的子单</h3>
+          <button class="btn ghost sm" @click="scopeDialog = null">关闭</button>
+        </div>
+        <p class="hint">父单做汇总与集成测试，子单各测自己的拆分需求。没选的子单会在报告里标「未覆盖」，整体结论也会相应变成「部分通过」。</p>
+        <div v-for="p in scopeDialog.parents" :key="p.identifier" class="stack" style="gap: 8px; border-top: 1px solid var(--line); padding-top: 12px">
+          <div class="row between">
+            <strong>{{ p.identifier }} {{ p.title }}</strong>
+            <button class="btn sm ghost" @click="toggleScopeAll(p.identifier)">{{ allScoped(p.identifier) ? '全不选' : '全选' }}</button>
+          </div>
+          <label v-for="c in p.children" :key="c.identifier" class="row" style="gap: 8px; cursor: pointer">
+            <input type="checkbox" :checked="scopeDialog.picked[p.identifier].has(c.identifier)" @change="toggleScope(p.identifier, c.identifier)" />
+            <span class="mono">{{ c.identifier }}</span>
+            <span>{{ c.title }}</span>
+            <span v-if="c.state" class="chip">{{ c.state }}</span>
+          </label>
+        </div>
+        <div class="row" style="justify-content: flex-end">
+          <button class="btn ghost" @click="scopeDialog = null">取消</button>
+          <button class="btn primary" @click="confirmScope"><Play :size="14" /> 开始测试</button>
         </div>
       </div>
     </div>

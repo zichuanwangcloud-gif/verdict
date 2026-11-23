@@ -31,7 +31,7 @@ func (h *Hub) input(ctx context.Context, run store.Run) (testplan.Input, error) 
 		RunID: run.ID, Issue: run.Issue, RepoURL: repo.URL, Branch: run.Branch,
 		Repo:     testplan.RepoInfo{TestNotes: repo.TestNotes, SetupCmd: repo.SetupCmd, StartCmd: repo.StartCmd, HealthURL: repo.HealthURL, AppURL: repo.AppURL},
 		Approved: run.Approved, ApprovalNote: run.ApprovalNote,
-		Commit: run.PinSHA, PlanSource: run.PlanSource,
+		Commit: run.PinSHA, PlanSource: run.PlanSource, Scope: run.Scope,
 	}, nil
 }
 

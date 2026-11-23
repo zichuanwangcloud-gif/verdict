@@ -209,6 +209,12 @@ var migrations = []struct{ table, column, def string }{
 	{"stages", "artifact_issues", "TEXT NOT NULL DEFAULT '[]'"},
 	{"runs", "shots", "TEXT NOT NULL DEFAULT '[]'"},
 	{"runs", "kind", "TEXT NOT NULL DEFAULT 'test'"},
+	// 主子 issue：set_id 把一次父单测试和它带的子单测试绑成一批；scope 是父 run 选中的子单。
+	{"runs", "set_id", "TEXT NOT NULL DEFAULT ''"},
+	{"runs", "issue_parent_key", "TEXT NOT NULL DEFAULT ''"},
+	{"runs", "scope", "TEXT NOT NULL DEFAULT '[]'"},
+	{"cases", "scope", "TEXT NOT NULL DEFAULT '[]'"},
+	{"version_issues", "scope", "TEXT NOT NULL DEFAULT '[]'"},
 }
 
 // 测试状态。
@@ -295,6 +301,8 @@ func migrate(db *sql.DB) error {
 		`CREATE INDEX IF NOT EXISTS runs_regression ON runs(regression_id)`,
 		`CREATE INDEX IF NOT EXISTS runs_parent ON runs(parent_run_id)`,
 		`CREATE INDEX IF NOT EXISTS runs_kind ON runs(kind)`,
+		`CREATE INDEX IF NOT EXISTS runs_set ON runs(set_id)`,
+		`CREATE INDEX IF NOT EXISTS runs_issue_parent ON runs(issue_parent_key)`,
 		`CREATE INDEX IF NOT EXISTS run_truths_verdict ON run_truths(verdict)`,
 	} {
 		if _, err := db.Exec(q); err != nil {

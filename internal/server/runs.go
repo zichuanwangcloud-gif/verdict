@@ -75,6 +75,8 @@ type runInput struct {
 	MaxCostUSD  *float64         `json:"max_cost_usd"` // 覆盖预设
 	VersionID   int64            `json:"version_id"`   // 归入版本（可选）
 	VersionMove bool             `json:"version_move"` // issue 已在别的版本里时是否移动过来
+	// ChildScope 是父单测试时选中的子单；为空表示只测这条 issue 自己。
+	ChildScope []string `json:"child_scope"`
 }
 
 func validBranch(b string) bool {
@@ -175,7 +177,46 @@ func (s *Server) startRun(ctx context.Context, in runInput) (store.Run, int, err
 		return store.Run{}, http.StatusBadRequest, errors.New("请填写 Linear issue 编号，或手动输入需求")
 	}
 
+	// 父单测试：校验选中的子单确实属于它，拉一次子单内容补进快照，再生成批次号。
+	scope := normalizeChildScope(in.ChildScope)
+	var childIssues []linear.Issue
+	if len(scope) > 0 {
+		if issue.Identifier == "MANUAL" {
+			return store.Run{}, http.StatusBadRequest, errors.New("手动输入的需求没有子单")
+		}
+		children := make(map[string]bool, len(issue.Children))
+		for _, c := range issue.Children {
+			children[c.Identifier] = true
+		}
+		for _, k := range scope {
+			if !children[k] {
+				return store.Run{}, http.StatusBadRequest, fmt.Errorf("%s 不是 %s 的子单", k, issue.Identifier)
+			}
+		}
+		client := linearClient(s.linearKey(ctx))
+		for _, k := range scope {
+			ci, err := client.GetIssue(ctx, k)
+			if err != nil {
+				log.Printf("子单 %s 拉取失败，本次跳过: %v", k, err)
+				continue
+			}
+			childIssues = append(childIssues, ci)
+		}
+		// 把描述补进父单快照，父单的计划阶段才能理解子单改了什么。
+		for i := range issue.Children {
+			for _, ci := range childIssues {
+				if issue.Children[i].Identifier == ci.Identifier {
+					issue.Children[i].Description = ci.Description
+					break
+				}
+			}
+		}
+	}
 	newRun := store.NewRun{RepoID: repo.ID, Branch: in.Branch, Issue: issue, RuntimeID: rt.ID, Config: resolveConfig(in, rt.Info)}
+	if len(scope) > 0 {
+		newRun.SetID = store.RandomHex(6)
+		newRun.Scope = scope
+	}
 	if in.VersionID > 0 {
 		v, err := s.st.Version(ctx, in.VersionID)
 		switch {
@@ -188,11 +229,24 @@ func (s *Server) startRun(ctx context.Context, in runInput) (store.Run, int, err
 		case issue.Identifier == "MANUAL":
 			return store.Run{}, http.StatusBadRequest, errors.New("手动输入的需求不能归入版本（版本要按 issue 编号跨版本积累回归）")
 		}
-		if err := s.st.AddVersionIssue(ctx, v, issue, in.VersionMove); err != nil {
+		var vScope []string
+		if in.ChildScope != nil {
+			vScope = scope
+		}
+		if err := s.st.AddVersionIssue(ctx, v, issue, vScope, in.VersionMove); err != nil {
 			if errors.Is(err, store.ErrIssueInOtherVersion) {
 				return store.Run{}, http.StatusConflict, err
 			}
 			return store.Run{}, http.StatusInternalServerError, err
+		}
+		// 父单进版本时，本次选中的子单一起成为版本成员。
+		for _, ci := range childIssues {
+			if err := s.st.AddVersionIssue(ctx, v, ci, nil, in.VersionMove); err != nil {
+				if errors.Is(err, store.ErrIssueInOtherVersion) {
+					return store.Run{}, http.StatusConflict, err
+				}
+				return store.Run{}, http.StatusInternalServerError, err
+			}
 		}
 		newRun.VersionID = v.ID
 	}
@@ -200,15 +254,51 @@ func (s *Server) startRun(ctx context.Context, in runInput) (store.Run, int, err
 	if err != nil {
 		return store.Run{}, http.StatusInternalServerError, err
 	}
+	if len(newRun.Scope) > 0 {
+		s.createChildRuns(ctx, newRun, issue.Identifier, childIssues)
+	}
 	go s.hub.Schedule(rt.ID)
 	return run, 0, nil
 }
 
+// normalizeChildScope 去空白、去重，保持用户选择的顺序。
+func normalizeChildScope(in []string) []string {
+	seen := map[string]bool{}
+	out := make([]string, 0, len(in))
+	for _, k := range in {
+		k = strings.TrimSpace(k)
+		if k == "" || seen[k] {
+			continue
+		}
+		seen[k] = true
+		out = append(out, k)
+	}
+	return out
+}
+
+// createChildRuns 为拉取成功的子单各建一条测试，共用父单的批次与配置。
+// 单条失败只记日志、不回滚父 run：报告里会把缺的子单标成「未创建」。
+func (s *Server) createChildRuns(ctx context.Context, parent store.NewRun, parentKey string, childIssues []linear.Issue) {
+	for _, child := range childIssues {
+		n := parent
+		n.Issue = child
+		n.IssueParentKey = parentKey
+		n.Scope = nil
+		n.VersionID = 0
+		if _, err := s.st.CreateRun(ctx, n); err != nil {
+			log.Printf("子单 %s 建测试失败: %v", child.Identifier, err)
+		}
+	}
+}
+
 type runDetail struct {
 	store.Run
-	Stages    []store.Stage    `json:"stages"`
-	Artifacts []store.Artifact `json:"artifacts"`
-	Truth     *store.Truth     `json:"truth"`
+	Stages     []store.Stage          `json:"stages"`
+	Artifacts  []store.Artifact       `json:"artifacts"`
+	Truth      *store.Truth           `json:"truth"`
+	SetSummary *store.IssueSetSummary `json:"set_summary,omitempty"` // 父 run 才有
+	// SetParentRunID 是子 run 所属批次的父 run，报告页用来跳回汇总。
+	SetParentRunID string `json:"set_parent_run_id,omitempty"`
 }
 
 func (s *Server) getRun(w http.ResponseWriter, r *http.Request) {
@@ -230,6 +320,16 @@ func (s *Server) getRun(w http.ResponseWriter, r *http.Request) {
 	d := runDetail{Run: run, Stages: stages, Artifacts: arts}
 	if t, err := s.st.Truth(r.Context(), run.ID); err == nil {
 		d.Truth = &t
+	}
+	// 父 run 带子单汇总与整体结论；子 run 带父 run 的入口。
+	if run.SetID != "" {
+		if run.IssueParentKey == "" {
+			if sm, err := s.st.SetSummary(r.Context(), run.ID); err == nil {
+				d.SetSummary = &sm
+			}
+		} else if p, err := s.st.SetParent(r.Context(), run.SetID); err == nil {
+			d.SetParentRunID = p.ID
+		}
 	}
 	ok(w, d)
 }

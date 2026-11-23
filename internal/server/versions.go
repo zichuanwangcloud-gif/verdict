@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"verdict/internal/linear"
 	"verdict/internal/protocol"
 	"verdict/internal/server/store"
 	"verdict/internal/testplan"
@@ -122,8 +123,9 @@ func (s *Server) addVersionIssue(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var in struct {
-		IssueKey string `json:"issue_key"`
-		Move     bool   `json:"move"`
+		IssueKey   string   `json:"issue_key"`
+		Move       bool     `json:"move"`
+		ChildScope []string `json:"child_scope"`
 	}
 	if err := decode(r, &in); err != nil {
 		fail(w, http.StatusBadRequest, err.Error())
@@ -143,18 +145,56 @@ func (s *Server) addVersionIssue(w http.ResponseWriter, r *http.Request) {
 		fail(w, http.StatusBadRequest, "请填写 issue 编号")
 		return
 	}
-	issue, err := linearClient(s.linearKey(r.Context())).GetIssue(r.Context(), in.IssueKey)
+	client := linearClient(s.linearKey(r.Context()))
+	issue, err := client.GetIssue(r.Context(), in.IssueKey)
 	if err != nil {
 		fail(w, http.StatusBadGateway, err.Error())
 		return
 	}
-	if err := s.st.AddVersionIssue(r.Context(), v, issue, in.Move); err != nil {
+	// 父单成员：确认子单范围后，把选中的子单一起加入版本。
+	scope := normalizeChildScope(in.ChildScope)
+	var childIssues []linear.Issue
+	if len(scope) > 0 {
+		children := make(map[string]bool, len(issue.Children))
+		for _, c := range issue.Children {
+			children[c.Identifier] = true
+		}
+		for _, k := range scope {
+			if !children[k] {
+				fail(w, http.StatusBadRequest, fmt.Sprintf("%s 不是 %s 的子单", k, issue.Identifier))
+				return
+			}
+		}
+		for _, k := range scope {
+			ci, err := client.GetIssue(r.Context(), k)
+			if err != nil {
+				fail(w, http.StatusBadGateway, err.Error())
+				return
+			}
+			childIssues = append(childIssues, ci)
+		}
+	}
+	var vScope []string
+	if in.ChildScope != nil {
+		vScope = scope
+	}
+	if err := s.st.AddVersionIssue(r.Context(), v, issue, vScope, in.Move); err != nil {
 		if errors.Is(err, store.ErrIssueInOtherVersion) {
 			fail(w, http.StatusConflict, err.Error())
 			return
 		}
 		failErr(w, err)
 		return
+	}
+	for _, ci := range childIssues {
+		if err := s.st.AddVersionIssue(r.Context(), v, ci, nil, in.Move); err != nil {
+			if errors.Is(err, store.ErrIssueInOtherVersion) {
+				fail(w, http.StatusConflict, err.Error())
+				return
+			}
+			failErr(w, err)
+			return
+		}
 	}
 	s.detail(w, r, v.ID)
 }
@@ -192,6 +232,9 @@ type matrixCell struct {
 	Runtime  string  `json:"runtime_name"`
 	Commit   string  `json:"commit_sha"`
 	Finished bool    `json:"finished"`
+	// Overall 是父单这一格的批次整体结论（通过 / 部分通过 / 部分未通过 / 未通过 / 未完成）；
+	// 普通行与子单行为空，直接看 verdict。
+	Overall string `json:"overall,omitempty"`
 }
 
 type matrixRow struct {
@@ -204,6 +247,9 @@ type matrixRow struct {
 	Cells       []*matrixCell `json:"cells"`            // 与 regressions 一一对应
 	Integration bool          `json:"integration"`      // 分支通过、冻结节点未通过
 	History     bool          `json:"history"`          // 基线用例：上一轮通过、这一轮未通过
+	// 父单成员在版本里覆盖的子单；子单成员指向所属父单，供前端分组。
+	Scope            []string `json:"scope,omitempty"`
+	ParentIdentifier string   `json:"parent_identifier,omitempty"`
 }
 
 type regressionRow struct {
@@ -284,10 +330,18 @@ func (s *Server) detail(w http.ResponseWriter, r *http.Request, id int64) {
 		}
 		return rows[key]
 	}
-	// 成员优先，保证顺序稳定。
+	// 成员优先，保证顺序稳定。父单记录覆盖范围，子单记录所属父单，前端据此分组。
+	parentOf := map[string]string{}
+	for _, vi := range issues {
+		for _, k := range vi.Scope {
+			parentOf[k] = vi.IssueKey
+		}
+	}
 	for _, vi := range issues {
 		row := rowFor(vi.IssueKey)
 		row.Title = vi.Issue.Title
+		row.Scope = vi.Scope
+		row.ParentIdentifier = parentOf[vi.IssueKey]
 	}
 	for _, b := range runs {
 		if b.RegressionID == "" {
@@ -383,6 +437,25 @@ func (s *Server) detail(w http.ResponseWriter, r *http.Request, id int64) {
 			}
 		}
 		out = append(out, *row)
+	}
+	// 父单行的每一格显示整批结论（按设计 §6.2），子单行仍看自己的 verdict。
+	for i := range out {
+		if len(out[i].Scope) == 0 {
+			continue
+		}
+		if b := out[i].Branch; b != nil && b.RunID != "" {
+			if sm, err := s.st.SetSummary(ctx, b.RunID); err == nil {
+				b.Overall = sm.Overall
+			}
+		}
+		for _, c := range out[i].Cells {
+			if c == nil || c.RunID == "" {
+				continue
+			}
+			if sm, err := s.st.SetSummary(ctx, c.RunID); err == nil {
+				c.Overall = sm.Overall
+			}
+		}
 	}
 	ok(w, versionDetail{Version: v, Regressions: regRows, Rows: out, Cases: cases})
 }
@@ -511,6 +584,19 @@ func (s *Server) freeze(ctx context.Context, versionID int64, in freezeInput) (s
 	fullRef := res.Ref
 
 	lk := s.linearKey(ctx)
+	// 父单成员把父子 run 绑成同一批次：父 run 带 scope，选中的子单 run 带 set_id 与父单编号。
+	setIDs := map[string]string{}
+	childParent := map[string]string{}
+	for _, vi := range issues {
+		if len(vi.Scope) > 0 {
+			setIDs[vi.IssueKey] = store.RandomHex(6)
+		}
+	}
+	for _, vi := range issues {
+		for _, k := range vi.Scope {
+			childParent[k] = vi.IssueKey
+		}
+	}
 	runs := make([]store.NewRun, 0, len(issues)+len(cases))
 	next := 0
 	pick := func() int64 {
@@ -532,6 +618,13 @@ func (s *Server) freeze(ctx context.Context, versionID int64, in freezeInput) (s
 		cfg = cfg.Normalize()
 		n := store.NewRun{RepoID: v.RepoID, Branch: in.Ref, Issue: issue, RuntimeID: pick(), Config: cfg,
 			VersionID: versionID, PinRef: fullRef, PinSHA: res.SHA, PlanSource: src, Attempt: 1}
+		if id, ok := setIDs[vi.IssueKey]; ok {
+			n.SetID = id
+			n.Scope = vi.Scope
+		} else if p, ok := childParent[vi.IssueKey]; ok {
+			n.SetID = setIDs[p]
+			n.IssueParentKey = p
+		}
 		if plan != nil {
 			n.PresetPlan = planJSON(plan)
 		}
@@ -637,7 +730,8 @@ func (s *Server) retryRegression(w http.ResponseWriter, r *http.Request) {
 		}
 		n := store.NewRun{RepoID: old.RepoID, Branch: old.Branch, Issue: old.Issue, RuntimeID: old.RuntimeID, Config: old.Config,
 			VersionID: old.VersionID, CaseID: old.CaseID, PinRef: old.PinRef, PinSHA: old.PinSHA, PlanSource: old.PlanSource,
-			PresetPlan: old.PresetPlan, Attempt: old.Attempt + 1}
+			PresetPlan: old.PresetPlan, Attempt: old.Attempt + 1,
+			SetID: old.SetID, IssueParentKey: old.IssueParentKey, Scope: old.Scope}
 		runs = append(runs, n)
 	}
 	if len(runs) == 0 {
@@ -730,6 +824,14 @@ func (s *Server) depositCases(ctx context.Context, v store.Version, g store.Regr
 	for _, c := range cases {
 		byIssue[c.IssueKey] = c
 	}
+	// 父单用例保留它在本版本里覆盖的子单范围。
+	vis, _ := s.st.VersionIssues(ctx, v.ID)
+	scopeByIssue := map[string][]string{}
+	for _, vi := range vis {
+		if len(vi.Scope) > 0 {
+			scopeByIssue[vi.IssueKey] = vi.Scope
+		}
+	}
 	for key, b := range latest {
 		// 没有未通过即可沉淀：部分无法验证的条目通常是环境所致，仍然值得长期回归。
 		if b.Status != store.StatusCompleted || (b.Verdict != protocol.VerdictPass && b.Verdict != protocol.VerdictPartial) {
@@ -740,7 +842,8 @@ func (s *Server) depositCases(ctx context.Context, v store.Version, g store.Regr
 			continue
 		}
 		plan, _ := s.st.RunPlan(ctx, run.ID)
-		c := store.Case{RepoID: v.RepoID, IssueKey: key, Issue: run.Issue, Plan: plan, SourceRunID: run.ID, SourceVersionID: v.ID}
+		c := store.Case{RepoID: v.RepoID, IssueKey: key, Issue: run.Issue, Plan: plan, SourceRunID: run.ID, SourceVersionID: v.ID,
+			Scope: scopeByIssue[key]}
 		if prev, ok := byIssue[key]; ok {
 			c.Level = prev.Level // 已有用例保留级别
 		}

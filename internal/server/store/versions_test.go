@@ -42,7 +42,7 @@ func TestVersionsAndMembers(t *testing.T) {
 		t.Fatalf("不同仓库可以重名: %v", err)
 	}
 
-	if err := st.AddVersionIssue(ctx, v, issue("ENG-1"), false); err != nil {
+	if err := st.AddVersionIssue(ctx, v, issue("ENG-1"), nil, false); err != nil {
 		t.Fatal(err)
 	}
 	if id, _ := st.IssueVersion(ctx, repo.ID, "ENG-1"); id != v.ID {
@@ -50,10 +50,10 @@ func TestVersionsAndMembers(t *testing.T) {
 	}
 	// 同一仓库另一个版本：不移动时冲突，移动后只剩一份。
 	v2, _ := st.CreateVersion(ctx, repo.ID, "1.5.0", "")
-	if err := st.AddVersionIssue(ctx, v2, issue("ENG-1"), false); !errors.Is(err, ErrIssueInOtherVersion) {
+	if err := st.AddVersionIssue(ctx, v2, issue("ENG-1"), nil, false); !errors.Is(err, ErrIssueInOtherVersion) {
 		t.Fatalf("应报已在其他版本: %v", err)
 	}
-	if err := st.AddVersionIssue(ctx, v2, issue("ENG-1"), true); err != nil {
+	if err := st.AddVersionIssue(ctx, v2, issue("ENG-1"), nil, true); err != nil {
 		t.Fatal(err)
 	}
 	if id, _ := st.IssueVersion(ctx, repo.ID, "ENG-1"); id != v2.ID {
@@ -67,10 +67,10 @@ func TestVersionsAndMembers(t *testing.T) {
 	if ok, _ := st.ReleaseVersion(ctx, v2.ID, ""); !ok {
 		t.Fatal("应能发布")
 	}
-	if err := st.AddVersionIssue(ctx, v, issue("ENG-1"), false); err != nil {
+	if err := st.AddVersionIssue(ctx, v, issue("ENG-1"), nil, false); err != nil {
 		t.Fatalf("已发布版本里的 issue 应能开始新一轮: %v", err)
 	}
-	if err := st.AddVersionIssue(ctx, v, issue("MANUAL"), false); err != nil {
+	if err := st.AddVersionIssue(ctx, v, issue("MANUAL"), nil, false); err != nil {
 		t.Fatal(err)
 	}
 	if err := st.DeleteRepo(ctx, repo.ID); err == nil {
@@ -84,7 +84,7 @@ func TestRegressionLifecycle(t *testing.T) {
 	rt, _, _ := st.CreateRuntime(ctx, "rt")
 	repo, _ := st.CreateRepo(ctx, Repo{URL: "u", Name: "n"})
 	v, _ := st.CreateVersion(ctx, repo.ID, "1.4.0", "")
-	st.AddVersionIssue(ctx, v, issue("ENG-1"), false)
+	st.AddVersionIssue(ctx, v, issue("ENG-1"), nil, false)
 
 	cfg := testplan.Preset("B")
 	cfg.Harness = "claude"
