@@ -31,14 +31,26 @@ type Coverage struct {
 	Reason   string `json:"reason"`
 }
 
-var roleNames = map[string]string{RoleUI: "UI 走查", RoleRed: "红队质疑", RoleExplore: "主动探索", RoleJudge: "裁决"}
+var roleNames = map[string]string{
+	RolePlan: "测试计划", RoleService: "启动托管服务", RoleVerify: "执行验证",
+	RoleUI: "UI 走查", RoleRed: "红队质疑", RoleExplore: "主动探索", RoleJudge: "裁决",
+}
 
 // coverage 判断承诺的阶段是否都成功。任意一轮红队成功即算达成。
+// 计划、服务、执行验证只要「发生过但没成功」就降级：这也代表结论的可信度打了折扣。
 func coverage(cfg Config, recs []StageRecord) Coverage {
 	var c Coverage
 	ok := func(role string) bool {
 		for _, r := range recs {
 			if r.Role == role && r.Status == StatusOK {
+				return true
+			}
+		}
+		return false
+	}
+	failed := func(role string) bool {
+		for _, r := range recs {
+			if r.Role == role && (r.Status == StatusError || r.Status == StatusTimeout) {
 				return true
 			}
 		}
@@ -62,6 +74,19 @@ func coverage(cfg Config, recs []StageRecord) Coverage {
 			c.Missing = append(c.Missing, role)
 		}
 	}
+	var notes []string
+	if failed(RolePlan) && ParsePlan(recs) == nil {
+		c.Missing = append(c.Missing, RolePlan)
+		notes = append(notes, "测试计划缺失，验证按通用方法进行")
+	}
+	if failed(RoleService) && !ok(RoleService) {
+		c.Missing = append(c.Missing, RoleService)
+		notes = append(notes, "平台未能启动被测服务，后续环境由模型自建，结论一致性下降")
+	}
+	if failed(RoleVerify) && !ok(RoleVerify) {
+		c.Missing = append(c.Missing, RoleVerify)
+		notes = append(notes, "执行验证未完成，结论部分来自进度文件")
+	}
 	if len(c.Missing) == 0 {
 		return c
 	}
@@ -73,7 +98,12 @@ func coverage(cfg Config, recs []StageRecord) Coverage {
 			c.Unjudged = true
 		}
 	}
-	c.Reason = "未达成：" + strings.Join(names, "、") + "（模型网关连续失败或重试次数用尽）"
+	var parts []string
+	if len(names) > 0 {
+		parts = append(parts, "未达成："+strings.Join(names, "、"))
+	}
+	parts = append(parts, notes...)
+	c.Reason = strings.Join(parts, "；")
 	return c
 }
 
@@ -102,6 +132,7 @@ func normConfidence(s string) string {
 var severityRank = map[string]int{"critical": 0, "high": 1, "medium": 2, "low": 3}
 
 // Consolidate 按阶段顺序叠加结论：计划 → 执行验证 → UI 走查 → 红队质疑 / 复测 → 主动探索 → 裁决。
+// 超时 / 失败但交了进度文件的阶段同样参与叠加，结论置信度统一降为低，覆盖强度仍记为降级。
 func Consolidate(cfg Config, recs []StageRecord) Result {
 	var res Result
 	idx := map[string]int{}
@@ -141,8 +172,20 @@ func Consolidate(cfg Config, recs []StageRecord) Result {
 
 	judged := false
 	for _, r := range recs {
-		if r.Status != StatusOK || len(r.Output) == 0 {
+		if len(r.Output) == 0 {
 			continue
+		}
+		adopted := Partial(r)
+		if r.Status != StatusOK && !adopted {
+			continue
+		}
+		// 进度文件里的结果只是数据：置信度按低处理，并注明这一环节没有正常结束。
+		mark := func(a *protocol.ACResult) {
+			if !adopted {
+				return
+			}
+			a.Confidence = "low"
+			a.Reasoning = strings.TrimSpace(a.Reasoning + "\n（本环节未完成，结果来自进度文件）")
 		}
 		switch r.Role {
 		case RoleVerify:
@@ -153,6 +196,7 @@ func Consolidate(cfg Config, recs []StageRecord) Result {
 			for _, x := range out.ACs {
 				a := get(x.ID, x.Criterion)
 				a.Status, a.Evidence, a.Reasoning, a.Confidence = normStatus(x.Status, false), x.Evidence, x.Reasoning, normConfidence(x.Confidence)
+				mark(a)
 			}
 			res.Summary = out.Summary
 
@@ -166,6 +210,7 @@ func Consolidate(cfg Config, recs []StageRecord) Result {
 				st := normStatus(x.Status, false)
 				if a.Method == "ui" || a.Status == protocol.ACUnverifiable || a.Evidence == "" {
 					a.Status, a.Evidence, a.Reasoning, a.Confidence = st, x.Evidence, x.Reasoning, normConfidence(x.Confidence)
+					mark(a)
 					continue
 				}
 				// 非界面条目：UI 结果作为补充证据；与原结论冲突时降低置信度。
@@ -174,6 +219,7 @@ func Consolidate(cfg Config, recs []StageRecord) Result {
 					a.Confidence = "low"
 					a.Reasoning = strings.TrimSpace(a.Reasoning + "\n（UI 走查结论为 " + st + "，与此不一致）")
 				}
+				mark(a)
 			}
 			res.Pages = append(res.Pages, out.Pages...)
 			res.Shots = append(res.Shots, out.Shots...)
@@ -213,6 +259,7 @@ func Consolidate(cfg Config, recs []StageRecord) Result {
 						a.Challenges[j].Response, a.Challenges[j].Resolution = x.Response, a.Status
 					}
 				}
+				mark(a)
 			}
 
 		case RoleExplore:
@@ -237,16 +284,22 @@ func Consolidate(cfg Config, recs []StageRecord) Result {
 				if x.Rationale != "" {
 					a.Reasoning = strings.TrimSpace("【裁决】" + x.Rationale + "\n\n" + a.Reasoning)
 				}
+				mark(a)
 			}
 			if out.Summary != "" {
 				res.Summary = out.Summary
 			}
 			// 裁决合并去重后的额外发现替换各阶段的原始列表；裁决没有给出时保留原始列表。
+			// 裁决是超时交卷的（结果不完整）时只追加，避免把其它阶段的发现弄丢。
 			if len(out.Findings) > 0 {
-				res.Findings = nil
+				if r.Status == StatusOK {
+					res.Findings = nil
+				}
 				addFindings(out.Findings, RoleJudge)
 			}
-			judged = true
+			if r.Status == StatusOK {
+				judged = true
+			}
 		}
 	}
 

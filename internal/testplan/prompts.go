@@ -37,7 +37,8 @@ func roleIntro(role string, round int, cfg Config) string {
 	return ""
 }
 
-func buildPrompt(role string, round int, cfg Config, in Input, recs []StageRecord) string {
+// buildPrompt 生成本阶段的提示词。limit 是本阶段实际分到的时限（分钟），会写进提示词。
+func buildPrompt(role string, round int, cfg Config, in Input, recs []StageRecord, limit int) string {
 	var b strings.Builder
 	b.WriteString(roleIntro(role, round, cfg))
 	b.WriteString("\n\n")
@@ -72,6 +73,9 @@ func buildPrompt(role string, round int, cfg Config, in Input, recs []StageRecor
 		writeExploreTask(&b, cur)
 	case RoleJudge:
 		writeJudgeTask(&b, plan, cur, recs)
+	}
+	if rule := progressRule(role, limit); rule != "" {
+		b.WriteString(rule)
 	}
 	if notes := suspiciousShots(recs); len(notes) > 0 && role != RoleShots {
 		b.WriteString("\n## 截图提示\n")
@@ -296,6 +300,37 @@ func writePlanTask(b *strings.Builder, cfg Config, in Input) {
 	if cfg.BriefPlan {
 		b.WriteString("\n本档位只做静态与命令行验证：条目保持精简，method 只能用 cli 或 code，needs_service 填 false。\n")
 	}
+	if cfg.Service {
+		b.WriteString(serviceScriptRules)
+	}
+}
+
+// serviceScriptRules 是启动脚本的硬约束：本次复盘里 14 次启动服务有 9 次失败，
+// 其中至少 7 次可以在生成阶段避免。
+const serviceScriptRules = `
+服务脚本硬约束（逐条核对后再输出）：
+1. 安装 / 启动脚本要能在基础命令行环境里运行；**第一行不要写 set -o pipefail、set -euo 这类严格模式开关**，平台会自己处理。
+2. 生成的登录签名密钥等凭证，长度至少 32 个字符；生成后自己核对一次。
+3. 复用已有的缓存 / 数据库容器时，对方要求密码就必须显式设置密码；不确定时改用本次测试专用的临时实例。**不要假设「没有密码也能连」**。
+4. setup_cmd 最后打印一行明确的成功标记（例如 echo setup-ok），方便平台判断脚本走到了哪一步。
+5. 仓库维护者已经写了安装 / 启动命令的，直接使用，不要另外生成。
+`
+
+// progressRule 要求需要产出多条结论的环节边做边交卷，超时也保住已经完成的条目。
+func progressRule(role string, limit int) string {
+	switch role {
+	case RoleVerify, RoleUI, RoleRed, RoleRecheck, RoleExplore, RoleJudge:
+	default:
+		return ""
+	}
+	return fmt.Sprintf(`
+## 进度交卷
+本环节限时 %d 分钟。每完成一批条目，就把当前结果写入环境变量 VERDICT_ARTIFACTS 目录下的 `+"`stage-result.json`"+`：
+- 结构与本阶段要求的结构化输出完全一致，**允许只包含已完成的条目**；
+- 时间将尽时，先保证这个文件是最新版本，再继续补充证据或说明。
+
+平台会在本环节结束（成功、失败或超时）后读取它：未完成时按它保底采用，并把结论标为「未完成」、置信度降为低。
+`, max(limit, 1))
 }
 
 // dataIsolationRules 要求被测服务使用本次测试专用的数据库 / 缓存，造的数据随收尾一起删除。

@@ -23,7 +23,7 @@ func parentInput() Input {
 }
 
 func TestPromptParentIncludesSelectedChildren(t *testing.T) {
-	p := buildPrompt(RolePlan, 0, Config{}, parentInput(), nil)
+	p := buildPrompt(RolePlan, 0, Config{}, parentInput(), nil, 15)
 	if !strings.Contains(p, "## 子单（这是汇总单，子单已拆分实现）") {
 		t.Fatalf("父单 prompt 缺少子单清单:\n%s", p)
 	}
@@ -49,7 +49,7 @@ func TestPromptChildShowsParent(t *testing.T) {
 			Parent: &linear.ParentRef{Identifier: "ENG-1", Title: "父单"},
 		},
 	}
-	p := buildPrompt(RolePlan, 0, Config{}, in, nil)
+	p := buildPrompt(RolePlan, 0, Config{}, in, nil, 15)
 	if !strings.Contains(p, "## 所属父单") || !strings.Contains(p, "ENG-1 父单") {
 		t.Fatalf("子单 prompt 缺少父单上下文:\n%s", p)
 	}
@@ -64,7 +64,7 @@ func TestPromptWithoutScopeHasNoTree(t *testing.T) {
 		Issue: linear.Issue{Identifier: "ENG-1", Title: "父单", Description: "需求",
 			Children: []linear.ChildRef{{Identifier: "ENG-2", Title: "子一"}}},
 	}
-	p := buildPrompt(RolePlan, 0, Config{}, in, nil)
+	p := buildPrompt(RolePlan, 0, Config{}, in, nil, 15)
 	if strings.Contains(p, "## 子单") {
 		t.Fatalf("没选子单时不应注入父单集成约束:\n%s", p)
 	}
@@ -82,7 +82,7 @@ func TestPromptClipsChildDescriptionWhenMany(t *testing.T) {
 	}
 	in.Issue.Children = children
 	in.Scope = []string{"ENG-2"}
-	p := buildPrompt(RolePlan, 0, Config{}, in, nil)
+	p := buildPrompt(RolePlan, 0, Config{}, in, nil, 15)
 	if strings.Contains(p, long) {
 		t.Fatal("子单过多时描述应被压缩")
 	}

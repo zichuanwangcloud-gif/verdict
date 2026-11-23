@@ -158,7 +158,7 @@ func (s *Store) SetStageRetry(ctx context.Context, id string, next time.Time) er
 
 // ClearStageRetry 把到点的重试阶段恢复成失败状态（保留失败原因），让流水线重新创建尝试。
 func (s *Store) ClearStageRetry(ctx context.Context, id string) error {
-	_, err := s.db.ExecContext(ctx, `UPDATE stages SET status=CASE WHEN failure_kind='transient' AND error LIKE '%超时%' THEN ? ELSE ? END,
+	_, err := s.db.ExecContext(ctx, `UPDATE stages SET status=CASE WHEN failure_kind IN ('transient','deadline') AND (error LIKE '%超过时限%' OR error LIKE '%超时%') THEN ? ELSE ? END,
  next_attempt_at='' WHERE id=? AND status=?`, testplan.StatusTimeout, testplan.StatusError, id, testplan.StatusRetryWait)
 	return err
 }

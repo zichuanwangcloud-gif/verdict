@@ -267,12 +267,41 @@ func (a *Agent) runStage(ctx context.Context, s *session, m protocol.Stage) prot
 		default:
 			res.Status, res.Structured = protocol.StageOK, out.Structured
 		}
+		// 超时 / 失败时，模型可能已经把已完成的条目写进了进度交卷文件：
+		// 合法 JSON 才采用，状态仍记为超时/失败，由汇总环节按“未完成、置信度低”处理。
+		if res.Status != protocol.StageOK && len(res.Structured) == 0 {
+			if p := progressResult(s.artifacts, t0); p != nil {
+				res.Structured = p
+				logf("⚠ 本阶段未正常结束，采用进度文件 stage-result.json（结论标为未完成）")
+			}
+		}
 
 	default:
 		res = protocol.StageResult{Status: protocol.StageError, Error: "未知阶段类型: " + m.Kind}
 	}
 	res.DurationMS = time.Since(t0).Milliseconds()
 	return res
+}
+
+// progressFile 是模型边做边交卷的进度文件，位于产物目录下。
+const progressFile = "stage-result.json"
+
+// progressResult 读取模型在超时 / 失败前写下的进度文件。
+// 只当数据用：必须是本阶段开始后写入的合法 JSON，否则当作没有，不影响现有行为。
+func progressResult(dir string, since time.Time) json.RawMessage {
+	path := filepath.Join(dir, progressFile)
+	st, err := os.Stat(path)
+	if err != nil || !st.Mode().IsRegular() || st.Size() > 4<<20 {
+		return nil
+	}
+	if st.ModTime().Before(since.Add(-2 * time.Second)) {
+		return nil // 上一轮留下的旧文件不能当成本阶段的结果
+	}
+	b, err := os.ReadFile(path)
+	if err != nil || !json.Valid(b) {
+		return nil
+	}
+	return json.RawMessage(b)
 }
 
 // onEnd 处理 finish / cancel：收尾工作区并上报 closed。

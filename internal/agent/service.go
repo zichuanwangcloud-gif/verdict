@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -25,6 +26,7 @@ const (
 	healthTimeout   = 3 * time.Minute  // 健康检查最长等待
 	noHealthWait    = 5 * time.Second  // 没有健康检查地址时，等待后确认进程仍存活
 	setupMaxOutput  = 4000             // 失败时回传的输出尾部字数
+	tailLines       = 10               // 拼进阶段错误的最后输出行数
 	stopGrace       = 10 * time.Second // 结束服务时 SIGTERM 到 SIGKILL 的宽限
 )
 
@@ -88,17 +90,73 @@ func clipTail(s string, n int) string {
 	return s
 }
 
+// 执行安装 / 启动脚本的解释器。计划阶段生成的脚本经常带只有 bash 支持的写法
+// （例如 set -o pipefail），优先用 bash；机器上没有 bash 时回退到 sh，行为与之前一致。
+var (
+	shellMu    sync.Mutex
+	shellReady bool
+	shellPath  string
+	shellFind  = defaultShell
+)
+
+func defaultShell() string {
+	if p, err := exec.LookPath("bash"); err == nil {
+		return p
+	}
+	return "sh"
+}
+
+func shellBinary() string {
+	shellMu.Lock()
+	defer shellMu.Unlock()
+	if !shellReady {
+		shellPath, shellReady = shellFind(), true
+	}
+	if shellPath == "" {
+		return "sh"
+	}
+	return shellPath
+}
+
 func shellCmd(ctx context.Context, dir, script string, env []string) *exec.Cmd {
+	bin := shellBinary()
 	var cmd *exec.Cmd
 	if ctx != nil {
-		cmd = exec.CommandContext(ctx, "sh", "-c", script)
+		cmd = exec.CommandContext(ctx, bin, "-c", script)
 	} else {
-		cmd = exec.Command("sh", "-c", script)
+		cmd = exec.Command(bin, "-c", script)
 	}
 	cmd.Dir = dir
 	cmd.Env = append(os.Environ(), env...)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	return cmd
+}
+
+// secretAssign 匹配 password=xxx、jwt.secret: xxx 这类赋值；只保留键名，值替换成 ***。
+var secretAssign = regexp.MustCompile(`(?i)(password|passwd|pwd|secret|token|api[\s_-]?key|密钥|密码|令牌)(\s*[:=]\s*)(\S+)`)
+
+// redact 对输出做脱敏：密码、密钥、令牌只保留键名。
+func redact(s string) string { return secretAssign.ReplaceAllString(s, "$1$2***") }
+
+// withTail 把脚本最后的输出附进错误，让报告里直接能看到失败原因，而不是只有一个退出码。
+func withTail(err error, tail string) error {
+	tail = redact(clipTail(lastLines(tail, tailLines), setupMaxOutput))
+	if tail == "" {
+		return err
+	}
+	return fmt.Errorf("%v\n最后的输出（已脱敏）：\n```\n%s\n```", err, tail)
+}
+
+func lastLines(s string, n int) string {
+	s = strings.TrimRight(s, "\n")
+	if s == "" {
+		return ""
+	}
+	lines := strings.Split(s, "\n")
+	if len(lines) > n {
+		lines = lines[len(lines)-n:]
+	}
+	return strings.Join(lines, "\n")
 }
 
 // runSetup 同步执行安装命令，输出逐行回传；超时或取消时结束整个进程组。
@@ -162,8 +220,8 @@ func (a *Agent) startService(ctx context.Context, s *session, spec protocol.Serv
 		logf("▶ 安装依赖：" + spec.SetupCmd)
 		out, err := runSetup(ctx, s.prep.Dir, spec.SetupCmd, env, logf)
 		if err != nil {
-			st.LogTail = out
-			return nil, st, fmt.Errorf("安装依赖失败: %v", err)
+			st.LogTail = redact(out)
+			return nil, st, withTail(fmt.Errorf("安装依赖失败: %v", err), out)
 		}
 	}
 
@@ -218,9 +276,9 @@ func (a *Agent) startService(ctx context.Context, s *session, spec protocol.Serv
 	}()
 
 	if err := waitHealthy(ctx, svc, spec.HealthURL, logf); err != nil {
-		st.LogTail = svc.Tail()
+		st.LogTail = redact(svc.Tail())
 		svc.Stop()
-		return nil, st, err
+		return nil, st, withTail(err, st.LogTail)
 	}
 	st.Running = true
 	logf("✔ 服务已就绪" + map[bool]string{true: "：" + st.URL, false: ""}[st.URL != ""])
@@ -252,7 +310,7 @@ func (s *session) expand(v string) string {
 	if !strings.Contains(v, "VERDICT_PORT") {
 		return v
 	}
-		// 与 env() 保持一致：VERDICT_PORT 和 VERDICT_PORT1 都指向第一个端口，PORTn 指向第 n 个。
+	// 与 env() 保持一致：VERDICT_PORT 和 VERDICT_PORT1 都指向第一个端口，PORTn 指向第 n 个。
 	for i := 0; i < 9; i++ {
 		key := "VERDICT_PORT"
 		if i > 0 {
