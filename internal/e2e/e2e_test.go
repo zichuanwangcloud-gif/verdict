@@ -151,6 +151,16 @@ func (f *fake) Run(ctx context.Context, spec harness.RunSpec) (harness.Output, e
 				{"id": "AC-2", "criterion": "首页可访问", "method": "ui", "preconditions": "", "steps": []string{"打开首页"}, "expected": "200"},
 			}})
 	case "verify":
+		if strings.Contains(spec.Prompt, "PROGRESS") {
+			// 模拟模型做了一半先交卷：写进度文件，然后一直做到阶段超时。
+			dir := envOf(spec, "VERDICT_ARTIFACTS")
+			os.MkdirAll(dir, 0o755)
+			progress, _ := json.Marshal(map[string]any{"summary": "部分完成（进度交卷）", "acs": []map[string]string{
+				{"id": "AC-1", "criterion": "", "status": "fail", "evidence": "进度文件：实际执行失败", "reasoning": "r", "confidence": "high", "response": ""}}})
+			os.WriteFile(filepath.Join(dir, "stage-result.json"), progress, 0o644)
+			<-ctx.Done()
+			return harness.Output{}, context.Cause(ctx)
+		}
 		if strings.Contains(spec.Prompt, "MODIFY") {
 			os.WriteFile(filepath.Join(spec.Dir, "feature.txt"), []byte("被改了\n"), 0o644)
 			os.WriteFile(filepath.Join(spec.Dir, "scratch.sh"), []byte("echo 临时脚本\n"), 0o644)
@@ -207,8 +217,12 @@ func (f *fake) Run(ctx context.Context, spec harness.RunSpec) (harness.Output, e
 	case "explore":
 		return out(map[string]any{"summary": "ex", "findings": []map[string]string{{"severity": "high", "title": "缺少输入校验", "detail": "d", "evidence": "e"}}})
 	case "judge":
+		status := "pass"
+		if strings.Contains(spec.Prompt, "PROGRESS") {
+			status = "fail" // 交卷场景里验收标准的结论本来就是未通过
+		}
 		return out(map[string]any{"summary": "裁决：全部通过", "acs": []map[string]string{
-			{"id": "AC-1", "status": "pass", "confidence": "high", "rationale": "复测确认"},
+			{"id": "AC-1", "status": status, "confidence": "high", "rationale": "复测确认"},
 			{"id": "AC-2", "status": "pass", "confidence": "medium", "rationale": "截图"}}})
 	}
 	return harness.Output{}, fmt.Errorf("未知角色")

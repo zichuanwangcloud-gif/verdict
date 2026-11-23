@@ -244,7 +244,7 @@ const legacySteps = computed(() => {
         <div class="stack" style="flex: 1">
           <b>覆盖强度降级{{ run.coverage.unjudged ? '：结论未经裁决' : '' }}</b>
           <span class="body">{{ run.coverage.reason }}</span>
-          <span class="hint">这是模型网关故障导致的，不代表这个档位的验收强度。可以点「从失败处继续」补跑缺失的阶段。</span>
+          <span class="hint">这不代表这个档位的验收强度。可以点「从失败处继续」补跑缺失的阶段。</span>
         </div>
       </div>
       <div v-if="run.parent_run_id" class="alert warn"><PlayCircle :size="16" /><span>这条测试续跑自 <a :href="'/runs/' + run.parent_run_id" @click.prevent="go('/runs/' + run.parent_run_id)">{{ run.parent_run_id }}</a>，已完成的阶段不会重跑。</span></div>

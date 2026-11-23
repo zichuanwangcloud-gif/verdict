@@ -7,6 +7,7 @@ import (
 	"log"
 	"slices"
 	"strconv"
+	"strings"
 	"time"
 
 	"verdict/internal/protocol"
@@ -349,7 +350,9 @@ func (h *Hub) advanceRetries(ctx context.Context, run store.Run, stages *[]store
 		}
 		attempt := h.nextAttempt(*stages, st.Spec)
 		spec := st.Spec
-		spec.Prompt = retryPrompt(spec.Prompt, st.Error, attempt)
+		if st.Kind == protocol.StageKindHarness {
+			spec.Prompt = retryPrompt(spec.Prompt, st, attempt)
+		}
 		created, err := h.st.AddStage(ctx, run.ID, spec, testplan.StatusPending, fmt.Sprintf("第 %d 次尝试（上次失败：%s）", attempt, clipText(st.Error, 120)), attempt)
 		if err != nil {
 			return true
@@ -360,6 +363,15 @@ func (h *Hub) advanceRetries(ctx context.Context, run store.Run, stages *[]store
 		return true
 	}
 	// 没有等待中的重试：看看最新的失败阶段要不要安排重试。
+	var in testplan.Input
+	inLoaded := false
+	loadInput := func() testplan.Input {
+		if !inLoaded {
+			in, _ = h.input(ctx, run)
+			inLoaded = true
+		}
+		return in
+	}
 	for _, st := range *stages {
 		if st.Status != testplan.StatusError && st.Status != testplan.StatusTimeout {
 			continue
@@ -367,23 +379,40 @@ func (h *Hub) advanceRetries(ctx context.Context, run store.Run, stages *[]store
 		if !h.isLatest(*stages, st) {
 			continue
 		}
-		if st.Kind != protocol.StageKindHarness || st.Harness != run.Config.Harness {
-			continue // 交叉模型失败交给流水线的降级逻辑
+		if st.Kind != protocol.StageKindHarness && st.Kind != protocol.StageKindService {
+			continue
 		}
 		if !testplan.RetryableFailure(st.FailureKind) {
 			continue
 		}
+		if st.Kind == protocol.StageKindHarness && st.Harness != run.Config.Harness {
+			continue // 交叉模型失败交给流水线的降级逻辑
+		}
+		// 主模型被拦截、且有另一个模型可用时，流水线会换模型重试一次。
+		if st.Kind == protocol.StageKindHarness && st.Role == testplan.RoleRed &&
+			st.FailureKind == testplan.FailureModel && run.Config.RedHarness != run.Config.Harness {
+			continue
+		}
 		attempts := 0
 		for _, x := range *stages {
-			if x.Role == st.Role && x.Round == st.Round && x.Kind == protocol.StageKindHarness {
+			if x.Role == st.Role && x.Round == st.Round && x.Kind == st.Kind {
 				attempts++
 			}
 		}
-		if attempts >= limit {
+		maxTries := limit // 设置里的重试上限沿用原有语义（最多尝试 limit 次）
+		if m := testplan.MaxRetriesFor(st.FailureKind); m >= 0 {
+			maxTries = m + 1 // 到点超时 / 模型拦截 / 服务可恢复失败：只重试 1 次
+		}
+		if attempts >= maxTries {
 			continue // 重试用完，交给流水线降级
 		}
-		if elapsed, _ := testplan.Usage(store.Records(*stages)); int(elapsed/60000) >= run.Config.MaxMinutes {
+		recs := store.Records(*stages)
+		if elapsed, _ := testplan.Usage(recs); int(elapsed/60000) >= run.Config.MaxMinutes {
 			continue // 预算不够
+		}
+		// 到点超时不是普通抖动：剩余预算要能覆盖两次预计耗时，否则重跑也是白跑。
+		if st.FailureKind == testplan.FailureDeadline && !testplan.CanRetry(run.Config, loadInput(), recs, st.Role, st.Round) {
+			continue
 		}
 		next := now.Add(time.Duration(testplan.RetryDelaySeconds(delay, attempts+1)) * time.Second)
 		if err := h.st.SetStageRetry(ctx, st.ID, next); err != nil {
@@ -410,10 +439,28 @@ func (h *Hub) isLatest(stages []store.Stage, st store.Stage) bool {
 	return true
 }
 
-// retryPrompt 在重试时追加一段说明，不复用上次失败的中间结果。
-func retryPrompt(prompt, lastErr string, attempt int) string {
-	return prompt + fmt.Sprintf("\n## 重试说明\n这是第 %d 次尝试，上一次执行这个阶段时失败：%s\n"+
-		"请从头完成本阶段的任务，不需要参考上次的任何中间结果。\n", attempt, clipText(lastErr, 300))
+// retryPrompt 在重试时追加续跑说明：带上上次的产物清单和进度文件，只补未完成的部分。
+func retryPrompt(prompt string, prev store.Stage, attempt int) string {
+	var b strings.Builder
+	b.WriteString(prompt)
+	fmt.Fprintf(&b, "\n## 重试说明\n这是第 %d 次尝试，上一次执行这个阶段时失败：%s\n", attempt, clipText(prev.Error, 300))
+	if n := testplan.ProgressCount(prev.Output); n > 0 {
+		fmt.Fprintf(&b, "上一次这个环节已经完成了 %d 条结论，写在 VERDICT_ARTIFACTS 目录下的 `stage-result.json` 里，平台已经采用。\n"+
+			"请先读取这个文件，只补未完成的部分，不要重复已经完成的检查。\n", n)
+	}
+	if len(prev.Artifacts) > 0 {
+		fmt.Fprintf(&b, "上一次留下的产物：%s。\n", strings.Join(clipNames(prev.Artifacts, 20), "、"))
+	}
+	b.WriteString("如果进度文件和产物不可用，再从头开始。\n")
+	return b.String()
+}
+
+// clipNames 只列出前 n 个产物名，避免提示词被长清单撑爆。
+func clipNames(names []string, n int) []string {
+	if len(names) <= n {
+		return names
+	}
+	return append(names[:n:n], fmt.Sprintf("等 %d 个", len(names)))
 }
 
 func clipText(s string, n int) string {
