@@ -35,8 +35,21 @@ var harnesses = []string{"claude", "codex"}
 // maxConcurrency 是并发度的硬上限，防止误填一个巨大值把机器打满。
 const maxConcurrency = 32
 
-// suggestConcurrency 按机器规模给出建议并发度：CPU 核数的一半、每 8GB 内存一个，取小的，夹在 [1, 8]。
-// 每个测试里都有模型子进程、构建和浏览器，不是纯 CPU 负载，所以不给满核数。
+// maxServiceSlots 是服务槽位的硬上限。
+const maxServiceSlots = 32
+
+// memPerTestMB 是给每个测试预留的内存预算（MB）。测试里同时有模型子进程、构建、
+// 浏览器和被测服务，8GB 往往不够；默认 12GB，可用 VERDICT_MEM_PER_TEST_MB 覆盖。
+var memPerTestMB = 12288
+
+func init() {
+	if v, err := strconv.Atoi(os.Getenv("VERDICT_MEM_PER_TEST_MB")); err == nil && v > 0 {
+		memPerTestMB = v
+	}
+}
+
+// suggestConcurrency 按机器规模给出建议并发度：CPU 核数的一半、每 memPerTestMB 内存一个，
+// 取小的，夹在 [1, 8]。每个测试里都有模型子进程、构建和浏览器，不是纯 CPU 负载。
 func suggestConcurrency(info *protocol.HostInfo) int {
 	if info == nil || (info.CPU == 0 && info.MemTotalMB == 0) {
 		return 1
@@ -46,7 +59,7 @@ func suggestConcurrency(info *protocol.HostInfo) int {
 		n = min(n, max(info.CPU/2, 1))
 	}
 	if info.MemTotalMB > 0 {
-		n = min(n, max(info.MemTotalMB/8192, 1))
+		n = min(n, max(info.MemTotalMB/memPerTestMB, 1))
 	}
 	return max(1, n)
 }
@@ -57,6 +70,26 @@ func effectiveConcurrency(rt store.Runtime) int {
 		return rt.Concurrency
 	}
 	return suggestConcurrency(rt.Info)
+}
+
+// suggestServiceSlots 默认按并发度算：并发度不超过 2 时一一对应，再往上取一半（至少 2）。
+// 服务进程是内存大户，不能跟着并发度线性增长。
+func suggestServiceSlots(rt store.Runtime) int {
+	c := effectiveConcurrency(rt)
+	if c <= 2 {
+		return c
+	}
+	return max(2, (c+1)/2)
+}
+
+// effectiveServiceSlots 是实际生效的服务槽位：用户设置优先，0 表示跟随建议值；
+// 再大也不会超过并发度（没有会话就没有服务）。
+func effectiveServiceSlots(rt store.Runtime) int {
+	n := rt.ServiceSlots
+	if n <= 0 {
+		n = suggestServiceSlots(rt)
+	}
+	return max(1, min(n, effectiveConcurrency(rt)))
 }
 
 // LinearEndpoint 便于测试时替换 Linear API 地址，生产环境为空。
@@ -354,6 +387,10 @@ type runtimeView struct {
 	EffectiveConcurrency int `json:"effective_concurrency"`
 	// SuggestedConcurrency 是按机器配置给出的建议值。
 	SuggestedConcurrency int `json:"suggested_concurrency"`
+	// EffectiveServiceSlots 是同时运行的托管服务数上限（用户设置优先，0 时按并发度算）。
+	EffectiveServiceSlots int `json:"effective_service_slots"`
+	// SuggestedServiceSlots 是按并发度给出的建议值。
+	SuggestedServiceSlots int `json:"suggested_service_slots"`
 }
 
 func (s *Server) listRuntimes(w http.ResponseWriter, r *http.Request) {
@@ -369,7 +406,8 @@ func (s *Server) listRuntimes(w http.ResponseWriter, r *http.Request) {
 		}
 		rt.Online = s.hub.Online(rt.ID)
 		out = append(out, runtimeView{Runtime: rt, Outdated: rt.Info != nil && rt.Info.Protocol != protocol.ProtocolVersion,
-			EffectiveConcurrency: effectiveConcurrency(rt), SuggestedConcurrency: suggestConcurrency(rt.Info)})
+			EffectiveConcurrency: effectiveConcurrency(rt), SuggestedConcurrency: suggestConcurrency(rt.Info),
+			EffectiveServiceSlots: effectiveServiceSlots(rt), SuggestedServiceSlots: suggestServiceSlots(rt)})
 	}
 	ok(w, out)
 }
@@ -407,8 +445,9 @@ func (s *Server) renameRuntime(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var in struct {
-		Name        *string `json:"name"`
-		Concurrency *int    `json:"concurrency"`
+		Name         *string `json:"name"`
+		Concurrency  *int    `json:"concurrency"`
+		ServiceSlots *int    `json:"service_slots"`
 	}
 	if err := decode(r, &in); err != nil {
 		fail(w, http.StatusBadRequest, err.Error())
@@ -435,6 +474,19 @@ func (s *Server) renameRuntime(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		go s.hub.Schedule(id) // 调高后可能立刻有槽位
+	}
+	if in.ServiceSlots != nil {
+		v := *in.ServiceSlots
+		if v < 0 || v > maxServiceSlots {
+			fail(w, http.StatusBadRequest, fmt.Sprintf("服务槽位只能是 0（按并发度自动）到 %d", maxServiceSlots))
+			return
+		}
+		if err := s.st.SetServiceSlots(r.Context(), id, v); err != nil {
+			failErr(w, err)
+			return
+		}
+		// 调高后可能立刻有槽位空出来，叫醒等待中的测试。
+		s.hub.WakeSlotWaiters(id)
 	}
 	ok(w, map[string]bool{"ok": true})
 }

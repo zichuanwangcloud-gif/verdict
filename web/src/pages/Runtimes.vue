@@ -1,6 +1,6 @@
 <script setup>
 import { ref, onMounted, onUnmounted } from 'vue'
-import { Plus, Server, RefreshCw, PencilLine, Trash2, Copy, Check, Terminal, ShieldAlert, X, Cpu, GitBranch, Container, Sparkles, MonitorSmartphone, KeyRound, ArrowUpCircle, Gauge } from 'lucide-vue-next'
+import { Plus, Server, RefreshCw, PencilLine, Trash2, Copy, Check, Terminal, ShieldAlert, X, Cpu, GitBranch, Container, Sparkles, MonitorSmartphone, KeyRound, ArrowUpCircle, Gauge, Layers } from 'lucide-vue-next'
 import { api } from '../api'
 import { ago } from '../format'
 import HarnessLogo from '../components/HarnessLogo.vue'
@@ -96,6 +96,23 @@ async function editConcurrency(rt) {
   }
   try {
     await api.setConcurrency(rt.id, n)
+    load()
+  } catch (e) {
+    err.value = e.message
+  }
+}
+
+async function editServiceSlots(rt) {
+  const cur = rt.service_slots > 0 ? rt.service_slots : ''
+  const v = prompt(`「${rt.name}」同时运行几个被测服务（1–32）。留空表示按并发度自动（建议 ${rt.suggested_service_slots}）。服务是内存大户，调低可以避免并发测试把机器内存打满。`, cur)
+  if (v === null) return
+  const n = v.trim() === '' ? 0 : Number(v)
+  if (!Number.isInteger(n) || n < 0 || n > 32) {
+    err.value = '服务槽位必须是 0（自动）到 32 之间的整数'
+    return
+  }
+  try {
+    await api.setServiceSlots(rt.id, n)
     load()
   } catch (e) {
     err.value = e.message
@@ -216,6 +233,10 @@ function hState(h) {
             <button class="chip" :title="rt.concurrency > 0 ? '手动设置（点击修改）' : '按机器自动（点击修改）'" @click="editConcurrency(rt)" style="cursor: pointer">
               <Gauge /> 并发 {{ rt.effective_concurrency }}<template v-if="rt.info.busy"> · 忙 {{ rt.info.busy }}</template>
               <span v-if="!rt.concurrency" class="muted">（自动）</span>
+            </button>
+            <button class="chip" :title="rt.service_slots > 0 ? '手动设置（点击修改）' : '按并发度自动（点击修改）'" @click="editServiceSlots(rt)" style="cursor: pointer">
+              <Layers /> 服务槽位 {{ rt.effective_service_slots }}
+              <span v-if="!rt.service_slots" class="muted">（自动）</span>
             </button>
           </div>
           <div class="stack" style="gap: 8px">

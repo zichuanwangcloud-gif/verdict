@@ -101,6 +101,7 @@ const liveLabel = computed(() => {
   if (r.status === 'preparing' || r.status === 'dispatched') return '准备工作区'
   if (r.status === 'awaiting_approval') return '等待你确认测试计划'
   if (r.status === 'finalizing') return '收尾：停止服务、检查源码改动'
+  if (r.waiting_slot) return '等待服务槽位（前面的测试结束后自动继续）'
   const s = currentStage.value
   if (!s) return 'agent 正在工作'
   return (roleMeta[s.role]?.name || s.role) + (s.round ? ` · 第 ${s.round} 轮` : '')

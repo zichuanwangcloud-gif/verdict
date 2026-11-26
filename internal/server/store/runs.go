@@ -64,10 +64,12 @@ type Run struct {
 	IssueParentKey string   `json:"issue_parent_key,omitempty"`
 	Scope          []string `json:"scope,omitempty"`
 	// Kind 是 run 的用途：test（验收测试）/ postmortem（差错复盘分析）。
-	Kind       string     `json:"kind"`
-	CreatedAt  *time.Time `json:"created_at"`
-	StartedAt  *time.Time `json:"started_at"`
-	FinishedAt *time.Time `json:"finished_at"`
+	Kind string `json:"kind"`
+	// WaitingSlot 表示测试已经跑完当前能跑的部分，正在等运行时的服务槽位。
+	WaitingSlot bool       `json:"waiting_slot"`
+	CreatedAt   *time.Time `json:"created_at"`
+	StartedAt   *time.Time `json:"started_at"`
+	FinishedAt  *time.Time `json:"finished_at"`
 }
 
 const runCols = `r.id, r.repo_id, p.url, p.name, p.ports, r.branch, r.commit_sha, r.issue_key, r.issue, r.runtime_id, t.name,
@@ -75,19 +77,19 @@ const runCols = `r.id, r.repo_id, p.url, p.name, p.ports, r.branch, r.commit_sha
  r.approved, r.approval_note, r.awaiting_since, r.source_modified, r.diff, r.prompt, r.raw, r.cost_usd, r.error,
  r.linear_comment_url, r.linear_error, r.version_id, r.regression_id, r.case_id, r.pin_ref, r.pin_sha, r.plan_source,
  r.preset_plan, r.ports, r.parent_run_id, r.coverage, r.attempt, r.created_at, r.started_at, r.finished_at, r.shots, r.kind,
- r.set_id, r.issue_parent_key, r.scope
+ r.set_id, r.issue_parent_key, r.scope, r.waiting_slot
  FROM runs r JOIN repos p ON p.id=r.repo_id JOIN runtimes t ON t.id=r.runtime_id`
 
 func scanRun(sc interface{ Scan(...any) error }) (Run, error) {
 	var r Run
 	var issue, cfg, acs, findings, pages, shots, awaiting, ports, cov, created, started, finished, scope string
-	var modified, approved int
+	var modified, approved, waiting int
 	err := sc.Scan(&r.ID, &r.RepoID, &r.RepoURL, &r.RepoName, &r.RepoPorts, &r.Branch, &r.CommitSHA, &r.IssueKey, &issue, &r.RuntimeID,
 		&r.RuntimeName, &r.Harness, &r.Tier, &cfg, &r.TimeoutMinutes, &r.Status, &r.CurrentStage, &r.Verdict, &r.Summary,
 		&acs, &findings, &pages, &approved, &r.ApprovalNote, &awaiting, &modified, &r.Diff, &r.Prompt, &r.Raw, &r.CostUSD,
 		&r.Error, &r.LinearCommentURL, &r.LinearError, &r.VersionID, &r.RegressionID, &r.CaseID, &r.PinRef, &r.PinSHA,
 		&r.PlanSource, &r.PresetPlan, &ports, &r.ParentRunID, &cov, &r.Attempt, &created, &started, &finished, &shots, &r.Kind,
-		&r.SetID, &r.IssueParentKey, &scope)
+		&r.SetID, &r.IssueParentKey, &scope, &waiting)
 	if err != nil {
 		return r, err
 	}
@@ -119,6 +121,7 @@ func scanRun(sc interface{ Scan(...any) error }) (Run, error) {
 		r.Scope = []string{}
 	}
 	r.SourceModified, r.Approved = modified != 0, approved != 0
+	r.WaitingSlot = waiting != 0
 	r.AwaitingSince = parseTime(awaiting)
 	r.CreatedAt, r.StartedAt, r.FinishedAt = parseTime(created), parseTime(started), parseTime(finished)
 	return r, nil
@@ -325,12 +328,17 @@ func (s *Store) CopyStages(ctx context.Context, fromRun, toRun string) (int, err
 		if st.Status != testplan.StatusOK && st.Status != testplan.StatusSkipped {
 			continue
 		}
+		// 服务阶段不复制：新测试的 agent 会话是全新的，服务需要重新拉起。
+		// 复制过来会让流水线误以为服务已在运行，后续阶段连不上服务。
+		if st.Kind == protocol.StageKindService {
+			continue
+		}
 		if _, err := tx.ExecContext(ctx, `INSERT INTO stages(id, run_id, seq, role, round, kind, harness, status, note, error, spec, output,
  cost_usd, duration_ms, service, artifacts, attempt, created_at, started_at, finished_at)
  VALUES(?, ?, (SELECT COALESCE(MAX(seq),0)+1 FROM stages WHERE run_id=?), ?, ?, ?, ?, ?, ?, '', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 			toRun+"-"+RandomHex(3), toRun, toRun, st.Role, st.Round, st.Kind, st.Harness, st.Status, st.Note, toJSON(st.Spec),
 			string(st.Output), st.CostUSD, st.DurationMS, toJSON(st.Service), toJSON(st.Artifacts), st.Attempt,
-			now(), st.StartedAt, st.FinishedAt); err != nil {
+			now(), timeOrEmpty(st.StartedAt), timeOrEmpty(st.FinishedAt)); err != nil {
 			return n, err
 		}
 		n++

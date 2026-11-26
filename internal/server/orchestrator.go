@@ -21,7 +21,19 @@ const (
 	approvalLimit   = 24 * time.Hour   // 计划等待确认的上限
 	finalizeLimit   = 15 * time.Minute // 收尾等待上限
 	maxStagesPerRun = 40               // 防御：流水线异常时不至于无限创建阶段
+	serviceSlotWait = 30 * time.Minute // 等不到服务槽位的上限，避免无限排队
 )
+
+// serviceWaitExpired 判断测试是不是已经等了太久服务槽位：从最后一个阶段结束算起。
+func serviceWaitExpired(stages []store.Stage, now time.Time) bool {
+	var last time.Time
+	for _, st := range stages {
+		if st.FinishedAt != nil && st.FinishedAt.After(last) {
+			last = *st.FinishedAt
+		}
+	}
+	return !last.IsZero() && now.Sub(last) > serviceSlotWait
+}
 
 func (h *Hub) input(ctx context.Context, run store.Run) (testplan.Input, error) {
 	repo, err := h.st.Repo(ctx, run.RepoID)
@@ -111,6 +123,9 @@ func (h *Hub) advance(ctx context.Context, runID string) error {
 			return h.finalize(ctx, c, run, stages, "阶段数量超过上限，流水线异常终止")
 		}
 		step := testplan.Next(run.Config, in, store.Records(stages))
+		if run.WaitingSlot {
+			h.markWaitingSlot(ctx, run.ID, false)
+		}
 		switch step.Action {
 		case testplan.ActionSkip:
 			st, err := h.st.AddStage(ctx, run.ID, step.Stage, testplan.StatusSkipped, step.Note, 1)
@@ -120,6 +135,17 @@ func (h *Hub) advance(ctx context.Context, runID string) error {
 			stages = append(stages, st)
 			continue
 		case testplan.ActionStage:
+			// 服务进程是内存大户：运行时同时运行的服务数受服务槽位限制。
+			// 没有空位时先不创建阶段，记下等待标记；槽位释放后会重新推进。
+			if step.Stage.Kind == protocol.StageKindService && !h.mayStartService(ctx, run) {
+				if serviceWaitExpired(stages, time.Now()) {
+					return h.finalize(ctx, c, run, stages, fmt.Sprintf(
+						"等待服务槽位超过 %d 分钟；请调高运行时的服务槽位或降低并发度后重新测试", int(serviceSlotWait.Minutes())))
+				}
+				h.markWaitingSlot(ctx, run.ID, true)
+				log.Printf("测试 %s 等待服务槽位（运行时 #%d）", run.ID, run.RuntimeID)
+				return nil
+			}
 			st, err := h.st.AddStage(ctx, run.ID, step.Stage, testplan.StatusPending, step.Note, h.nextAttempt(stages, step.Stage))
 			if err != nil {
 				return err
@@ -291,6 +317,8 @@ func (h *Hub) sweep(ctx context.Context, now time.Time) {
 	for _, rt := range rts {
 		if h.Online(rt.ID) {
 			go h.Schedule(rt.ID)
+			// 兜底：即使没有新的阶段事件，也定期检查等待服务槽位的测试是否已经可以继续。
+			h.WakeSlotWaiters(rt.ID)
 		}
 	}
 }
@@ -344,6 +372,13 @@ func (h *Hub) advanceRetries(ctx context.Context, run store.Run, stages *[]store
 		if now.Before(*st.NextAttempt) {
 			return true // 还没到点
 		}
+		// 服务阶段重试同样要等服务槽位；没空位就把重试时间顺延，不占着阶段不放。
+		if st.Kind == protocol.StageKindService && !h.mayStartService(ctx, run) {
+			h.markWaitingSlot(ctx, run.ID, true)
+			_ = h.st.SetStageRetry(ctx, st.ID, now.Add(30*time.Second))
+			return true
+		}
+		h.markWaitingSlot(ctx, run.ID, false)
 		// 到点：把这个阶段恢复成失败记录，再创建一个新的尝试。
 		if err := h.st.ClearStageRetry(ctx, st.ID); err != nil {
 			continue
