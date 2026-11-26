@@ -269,6 +269,8 @@ func (h *Hub) onHello(ctx context.Context, c *agentConn, m protocol.Hello) error
 		go h.Advance(id)
 	}
 	go h.Schedule(c.runtimeID)
+	// 重连后可能已经有服务槽位空出来，叫醒等待中的测试。
+	h.WakeSlotWaiters(c.runtimeID)
 	return nil
 }
 
@@ -312,6 +314,10 @@ func (h *Hub) onEvent(ctx context.Context, c *agentConn, ev protocol.Event) erro
 		if _, err = h.st.FinishStage(ctx, ev.StageID, *ev.Stage); err == nil {
 			err = h.refreshResult(ctx, run)
 			advance = true
+			// 服务阶段失败/超时：槽位已经空出来，叫醒正在等的测试。
+			if ev.Stage.Service != nil && ev.Stage.Status != protocol.StageOK {
+				h.WakeSlotWaiters(run.RuntimeID)
+			}
 		}
 	case protocol.KindClosed:
 		if ev.Closed == nil {
@@ -352,6 +358,8 @@ func (h *Hub) onClosed(ctx context.Context, run store.Run, c protocol.ClosedResu
 	}
 	h.closeRun(ctx, run.ID, status, msg, c)
 	go h.Schedule(run.RuntimeID)
+	// 测试结束会释放它占着的服务槽位，叫醒正在等的测试。
+	h.WakeSlotWaiters(run.RuntimeID)
 }
 
 // closeRun 写入终态并触发回写。

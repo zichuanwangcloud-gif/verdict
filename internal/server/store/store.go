@@ -200,6 +200,8 @@ var migrations = []struct{ table, column, def string }{
 	{"runs", "attempt", "INTEGER NOT NULL DEFAULT 1"},
 	{"runs", "ports", "TEXT NOT NULL DEFAULT '[]'"},
 	{"runtimes", "concurrency", "INTEGER NOT NULL DEFAULT 0"},
+	// service_slots 限制同一运行时上同时运行的托管服务数；0 表示按并发度自动取值。
+	{"runtimes", "service_slots", "INTEGER NOT NULL DEFAULT 0"},
 	{"repos", "ports", "INTEGER NOT NULL DEFAULT 1"},
 	{"runs", "parent_run_id", "TEXT NOT NULL DEFAULT ''"},
 	{"runs", "coverage", "TEXT NOT NULL DEFAULT '{}'"},
@@ -213,6 +215,8 @@ var migrations = []struct{ table, column, def string }{
 	{"runs", "set_id", "TEXT NOT NULL DEFAULT ''"},
 	{"runs", "issue_parent_key", "TEXT NOT NULL DEFAULT ''"},
 	{"runs", "scope", "TEXT NOT NULL DEFAULT '[]'"},
+	// waiting_slot 表示测试已经跑完当前能跑的部分，正在等运行时的服务槽位。
+	{"runs", "waiting_slot", "INTEGER NOT NULL DEFAULT 0"},
 	{"cases", "scope", "TEXT NOT NULL DEFAULT '[]'"},
 	{"version_issues", "scope", "TEXT NOT NULL DEFAULT '[]'"},
 }
@@ -316,6 +320,14 @@ func (s *Store) Close() error { return s.db.Close() }
 
 func now() string { return time.Now().UTC().Format(time.RFC3339) }
 
+// timeOrEmpty 把可空时间转成数据库里的 TEXT 值；阶段可能还没开始（例如直接跳过的阶段）。
+func timeOrEmpty(t *time.Time) string {
+	if t == nil {
+		return ""
+	}
+	return t.UTC().Format(time.RFC3339)
+}
+
 func parseTime(v string) *time.Time {
 	if v == "" {
 		return nil
@@ -385,10 +397,12 @@ type Runtime struct {
 	Name string             `json:"name"`
 	Info *protocol.HostInfo `json:"info"`
 	// Concurrency 是用户设置的并发度；0 表示按机器规模自动取值。
-	Concurrency int        `json:"concurrency"`
-	LastSeen    *time.Time `json:"last_seen"`
-	CreatedAt   *time.Time `json:"created_at"`
-	Online      bool       `json:"online"` // 由 hub 填充
+	Concurrency int `json:"concurrency"`
+	// ServiceSlots 是同时运行的托管服务数上限；0 表示按并发度自动取值。
+	ServiceSlots int        `json:"service_slots"`
+	LastSeen     *time.Time `json:"last_seen"`
+	CreatedAt    *time.Time `json:"created_at"`
+	Online       bool       `json:"online"` // 由 hub 填充
 }
 
 // CreateRuntime 返回运行时与明文令牌（只此一次）。
@@ -403,12 +417,12 @@ func (s *Store) CreateRuntime(ctx context.Context, name string) (Runtime, string
 	return rt, token, err
 }
 
-const runtimeCols = `id, name, info, concurrency, last_seen, created_at`
+const runtimeCols = `id, name, info, concurrency, service_slots, last_seen, created_at`
 
 func scanRuntime(sc interface{ Scan(...any) error }) (Runtime, error) {
 	var rt Runtime
 	var info, seen, created string
-	if err := sc.Scan(&rt.ID, &rt.Name, &info, &rt.Concurrency, &seen, &created); err != nil {
+	if err := sc.Scan(&rt.ID, &rt.Name, &info, &rt.Concurrency, &rt.ServiceSlots, &seen, &created); err != nil {
 		return rt, err
 	}
 	_ = json.Unmarshal([]byte(info), &rt.Info)
@@ -463,6 +477,18 @@ func (s *Store) TouchRuntime(ctx context.Context, id int64) error {
 // SetConcurrency 设置并发度；0 表示跟随按机器算出的建议值。
 func (s *Store) SetConcurrency(ctx context.Context, id int64, n int) error {
 	res, err := s.db.ExecContext(ctx, `UPDATE runtimes SET concurrency=? WHERE id=?`, n, id)
+	if err != nil {
+		return err
+	}
+	if c, _ := res.RowsAffected(); c == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// SetServiceSlots 设置同时运行的托管服务数上限；0 表示跟随按并发度算出的建议值。
+func (s *Store) SetServiceSlots(ctx context.Context, id int64, n int) error {
+	res, err := s.db.ExecContext(ctx, `UPDATE runtimes SET service_slots=? WHERE id=?`, n, id)
 	if err != nil {
 		return err
 	}
